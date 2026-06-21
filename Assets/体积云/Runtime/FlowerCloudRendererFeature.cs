@@ -13,6 +13,7 @@ namespace FlowerClouds
         {
             [Header("Shaders")]
             public ComputeShader raymarchCompute;
+            public ComputeShader reconstructCompute;
             public Shader compositeShader;
 
             [Header("Lighting")]
@@ -73,17 +74,23 @@ namespace FlowerClouds
             [Range(1, 4)]
             public int downsample = 4;
 
+            [Header("Temporal Reconstruction")]
+            public bool enableTemporalReconstruction = true;
+
+            [Range(0.0f, 0.98f)]
+            public float temporalBlend = 0.90f;
+
             [Range(8, 128)]
             public int viewStepCount = 64;
 
             [Range(1, 16)]
             public int lightStepCount = 6;
 
-            [Range(0.00001f, 0.01f)]
-            public float viewExtinction = 0.001f;
+            [Min(1.0f)]
+            public float cloudMaxTracingDistanceKm = 50.0f;
 
-            [Range(0.00001f, 0.01f)]
-            public float lightExtinction = 0.0015f;
+            [Min(1.0f)]
+            public float cloudTracingStartMaxDistanceKm = 350.0f;
 
             [Header("Phase")]
             [Range(0.0f, 0.95f)]
@@ -176,14 +183,18 @@ namespace FlowerClouds
         {
             private readonly Settings settings;
             private readonly Material compositeMaterial;
-            private readonly ProfilingSampler profilingSampler;
+            private readonly ProfilingSampler cloudProfilingSampler;
 
             private RTHandle cameraColorTarget;
             private RTHandle cloudColorTexture;
             private RTHandle cloudDepthTexture;
+            private RTHandle cloudReconstructionTexture;
+            private RTHandle cloudHistoryTexture;
             private RTHandle cameraColorCopy;
 
             private uint frameIndex;
+            private bool hasHistory;
+            private Matrix4x4 previousViewProjectionMatrix = Matrix4x4.identity;
 
             private static readonly int OutputSizeID =
                 Shader.PropertyToID("_OutputSize");
@@ -208,6 +219,12 @@ namespace FlowerClouds
 
             private static readonly int CameraAspectID =
                 Shader.PropertyToID("_CameraAspect");
+
+            private static readonly int PreviousViewProjectionMatrixID =
+                Shader.PropertyToID("_PreviousViewProjectionMatrix");
+
+            private static readonly int TemporalBlendID =
+                Shader.PropertyToID("_TemporalBlend");
 
             private static readonly int FrameIndexID =
                 Shader.PropertyToID("_FrameIndex");
@@ -251,11 +268,11 @@ namespace FlowerClouds
             private static readonly int LightStepCountID =
                 Shader.PropertyToID("_LightStepCount");
 
-            private static readonly int ViewExtinctionID =
-                Shader.PropertyToID("_ViewExtinction");
+            private static readonly int CloudMaxTracingDistanceKmID =
+                Shader.PropertyToID("_CloudMaxTracingDistanceKm");
 
-            private static readonly int LightExtinctionID =
-                Shader.PropertyToID("_LightExtinction");
+            private static readonly int CloudTracingStartMaxDistanceKmID =
+                Shader.PropertyToID("_CloudTracingStartMaxDistanceKm");
 
             private static readonly int CloudLightBasicStepKmID =
                 Shader.PropertyToID("_CloudLightBasicStepKm");
@@ -308,6 +325,18 @@ namespace FlowerClouds
             private static readonly int CloudDepthOutputID =
                 Shader.PropertyToID("_CloudDepthTexture");
 
+            private static readonly int CloudLowResColorID =
+                Shader.PropertyToID("_CloudLowResColorTexture");
+
+            private static readonly int CloudLowResDepthID =
+                Shader.PropertyToID("_CloudLowResDepthTexture");
+
+            private static readonly int CloudHistoryID =
+                Shader.PropertyToID("_CloudHistoryTexture");
+
+            private static readonly int CloudReconstructionOutputID =
+                Shader.PropertyToID("_CloudReconstructionTexture");
+
             private static readonly int GlobalBasicNoiseID =
                 Shader.PropertyToID("_FlowerCloudBasicNoise");
 
@@ -355,7 +384,7 @@ namespace FlowerClouds
                 this.settings = settings;
                 this.compositeMaterial = compositeMaterial;
 
-                profilingSampler =
+                cloudProfilingSampler =
                     new ProfilingSampler("Flower Volumetric Clouds");
             }
 
@@ -413,6 +442,36 @@ namespace FlowerClouds
                     FilterMode.Bilinear,
                     TextureWrapMode.Clamp,
                     name: "_FlowerCloudDepthQuarter"
+                );
+
+                RenderTextureDescriptor reconstructionDescriptor =
+                    cameraDescriptor;
+
+                reconstructionDescriptor.depthBufferBits = 0;
+                reconstructionDescriptor.msaaSamples = 1;
+                reconstructionDescriptor.enableRandomWrite = true;
+                reconstructionDescriptor.graphicsFormat =
+                    GraphicsFormat.R16G16B16A16_SFloat;
+
+                RenderingUtils.ReAllocateIfNeeded(
+                    ref cloudReconstructionTexture,
+                    reconstructionDescriptor,
+                    FilterMode.Bilinear,
+                    TextureWrapMode.Clamp,
+                    name: "_FlowerCloudReconstruction"
+                );
+
+                RenderTextureDescriptor historyDescriptor =
+                    reconstructionDescriptor;
+
+                historyDescriptor.enableRandomWrite = false;
+
+                RenderingUtils.ReAllocateIfNeeded(
+                    ref cloudHistoryTexture,
+                    historyDescriptor,
+                    FilterMode.Bilinear,
+                    TextureWrapMode.Clamp,
+                    name: "_FlowerCloudReconstructionHistory"
                 );
 
                 RenderTextureDescriptor colorCopyDescriptor =
@@ -490,7 +549,9 @@ namespace FlowerClouds
                 CommandBuffer commandBuffer =
                     CommandBufferPool.Get();
 
-                using (new ProfilingScope(commandBuffer, profilingSampler))
+                Matrix4x4 currentViewProjectionMatrix = Matrix4x4.identity;
+
+                using (new ProfilingScope(commandBuffer, cloudProfilingSampler))
                 {
                     Camera camera = renderingData.cameraData.camera;
 
@@ -499,6 +560,12 @@ namespace FlowerClouds
                     Vector3 cameraUp = camera.transform.up.normalized;
                     float cameraTanHalfFov = Mathf.Tan(camera.fieldOfView * 0.5f * Mathf.Deg2Rad);
                     float cameraAspect = camera.aspect;
+                    currentViewProjectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, false) * camera.worldToCameraMatrix;
+
+                    if (!hasHistory)
+                    {
+                        previousViewProjectionMatrix = currentViewProjectionMatrix;
+                    }
 
                     Light sunLight = RenderSettings.sun;
 
@@ -660,14 +727,14 @@ namespace FlowerClouds
 
                     commandBuffer.SetComputeFloatParam(
                         settings.raymarchCompute,
-                        ViewExtinctionID,
-                        settings.viewExtinction
+                        CloudMaxTracingDistanceKmID,
+                        settings.cloudMaxTracingDistanceKm
                     );
 
                     commandBuffer.SetComputeFloatParam(
                         settings.raymarchCompute,
-                        LightExtinctionID,
-                        settings.lightExtinction
+                        CloudTracingStartMaxDistanceKmID,
+                        settings.cloudTracingStartMaxDistanceKm
                     );
 
                     commandBuffer.SetComputeFloatParam(
@@ -870,9 +937,139 @@ namespace FlowerClouds
                         1
                     );
 
+                    RTHandle cloudTextureForComposite =
+                        cloudColorTexture;
+
+                    if (settings.enableTemporalReconstruction &&
+                        settings.reconstructCompute != null &&
+                        cloudReconstructionTexture != null &&
+                        cloudHistoryTexture != null)
+                    {
+                        int reconstructKernel =
+                            settings.reconstructCompute.FindKernel("CSMain");
+
+                        commandBuffer.SetComputeIntParams(
+                            settings.reconstructCompute,
+                            OutputSizeID,
+                            cloudWidth,
+                            cloudHeight
+                        );
+
+                        commandBuffer.SetComputeIntParams(
+                            settings.reconstructCompute,
+                            FullResolutionID,
+                            camera.pixelWidth,
+                            camera.pixelHeight
+                        );
+
+                        commandBuffer.SetComputeVectorParam(
+                            settings.reconstructCompute,
+                            CameraPositionID,
+                            camera.transform.position
+                        );
+
+                        commandBuffer.SetComputeVectorParam(
+                            settings.reconstructCompute,
+                            CameraForwardID,
+                            new Vector4(cameraForward.x, cameraForward.y, cameraForward.z, 0.0f)
+                        );
+
+                        commandBuffer.SetComputeVectorParam(
+                            settings.reconstructCompute,
+                            CameraRightID,
+                            new Vector4(cameraRight.x, cameraRight.y, cameraRight.z, 0.0f)
+                        );
+
+                        commandBuffer.SetComputeVectorParam(
+                            settings.reconstructCompute,
+                            CameraUpID,
+                            new Vector4(cameraUp.x, cameraUp.y, cameraUp.z, 0.0f)
+                        );
+
+                        commandBuffer.SetComputeFloatParam(
+                            settings.reconstructCompute,
+                            CameraTanHalfFovID,
+                            cameraTanHalfFov
+                        );
+
+                        commandBuffer.SetComputeFloatParam(
+                            settings.reconstructCompute,
+                            CameraAspectID,
+                            cameraAspect
+                        );
+
+                        commandBuffer.SetComputeMatrixParam(
+                            settings.reconstructCompute,
+                            PreviousViewProjectionMatrixID,
+                            previousViewProjectionMatrix
+                        );
+
+                        commandBuffer.SetComputeFloatParam(
+                            settings.reconstructCompute,
+                            TemporalBlendID,
+                            hasHistory ? settings.temporalBlend : 0.0f
+                        );
+
+                        commandBuffer.SetComputeIntParam(
+                            settings.reconstructCompute,
+                            FrameIndexID,
+                            (int)frameIndex
+                        );
+
+                        commandBuffer.SetComputeTextureParam(
+                            settings.reconstructCompute,
+                            reconstructKernel,
+                            CloudLowResColorID,
+                            cloudColorTexture
+                        );
+
+                        commandBuffer.SetComputeTextureParam(
+                            settings.reconstructCompute,
+                            reconstructKernel,
+                            CloudLowResDepthID,
+                            cloudDepthTexture
+                        );
+
+                        commandBuffer.SetComputeTextureParam(
+                            settings.reconstructCompute,
+                            reconstructKernel,
+                            CloudHistoryID,
+                            cloudHistoryTexture
+                        );
+
+                        commandBuffer.SetComputeTextureParam(
+                            settings.reconstructCompute,
+                            reconstructKernel,
+                            CloudReconstructionOutputID,
+                            cloudReconstructionTexture
+                        );
+
+                        int reconstructGroupCountX =
+                            Mathf.CeilToInt(camera.pixelWidth / 8.0f);
+
+                        int reconstructGroupCountY =
+                            Mathf.CeilToInt(camera.pixelHeight / 8.0f);
+
+                        commandBuffer.DispatchCompute(
+                            settings.reconstructCompute,
+                            reconstructKernel,
+                            reconstructGroupCountX,
+                            reconstructGroupCountY,
+                            1
+                        );
+
+                        commandBuffer.CopyTexture(
+                            cloudReconstructionTexture,
+                            cloudHistoryTexture
+                        );
+
+                        cloudTextureForComposite =
+                            cloudReconstructionTexture;
+                    }
+
                     commandBuffer.SetGlobalTexture(
                         CompositeCloudColorID,
-                        cloudColorTexture
+                        cloudTextureForComposite
                     );
 
                     Blitter.BlitCameraTexture(
@@ -894,6 +1091,8 @@ namespace FlowerClouds
                 commandBuffer.Clear();
                 CommandBufferPool.Release(commandBuffer);
 
+                previousViewProjectionMatrix = currentViewProjectionMatrix;
+                hasHistory = true;
                 frameIndex++;
             }
 
@@ -904,6 +1103,12 @@ namespace FlowerClouds
 
                 cloudDepthTexture?.Release();
                 cloudDepthTexture = null;
+
+                cloudReconstructionTexture?.Release();
+                cloudReconstructionTexture = null;
+
+                cloudHistoryTexture?.Release();
+                cloudHistoryTexture = null;
 
                 cameraColorCopy?.Release();
                 cameraColorCopy = null;

@@ -38,6 +38,9 @@ SAMPLER(sampler_FlowerDistantLitGrid);
 RWTexture2D<float4> _CloudColorTexture;
 RWTexture2D<float> _CloudDepthTexture;
 
+TEXTURE2D_X(_CameraDepthTexture);
+SAMPLER(sampler_CameraDepthTexture);
+
 int2 _OutputSize;
 int2 _FullResolution;
 
@@ -66,8 +69,8 @@ float _CloudSpeed;
 int _ViewStepCount;
 int _LightStepCount;
 
-float _ViewExtinction;
-float _LightExtinction;
+float _CloudMaxTracingDistanceKm;
+float _CloudTracingStartMaxDistanceKm;
 float _CloudLightBasicStepKm;
 
 float3 _SunDirection;
@@ -140,86 +143,196 @@ float GetNearestPositiveHit(float2 hit)
     return 1e20;
 }
 
-bool GetCloudRaySegment(
-    float3 rayOrigin,
+float2 RaySphereCenteredKm(
+    float3 rayOriginKm,
     float3 rayDirection,
-    out float rayStart,
-    out float rayEnd)
+    float sphereRadiusKm)
 {
-    rayStart = 0.0;
-    rayEnd = 0.0;
+    float b =
+        dot(
+            rayOriginKm,
+            rayDirection
+        );
 
-    float innerRadius = _PlanetRadius + _CloudBottom;
-    float outerRadius = _PlanetRadius + _CloudTop;
+    float c =
+        dot(
+            rayOriginKm,
+            rayOriginKm
+        ) -
+        sphereRadiusKm *
+        sphereRadiusKm;
 
-    float2 innerHit = RaySphere(
-        rayOrigin,
-        rayDirection,
-        _PlanetCenter,
-        innerRadius
+    float discriminant =
+        b * b - c;
+
+    if (discriminant < 0.0)
+    {
+        return float2(-1.0, -1.0);
+    }
+
+    float squareRoot =
+        sqrt(discriminant);
+
+    return float2(
+        -b - squareRoot,
+        -b + squareRoot
     );
+}
 
-    float2 outerHit = RaySphere(
-        rayOrigin,
-        rayDirection,
-        _PlanetCenter,
-        outerRadius
-    );
+bool GetCloudRaySegmentKm(
+    float3 rayOriginWS,
+    float3 rayDirection,
+    out float rayStartKm,
+    out float rayEndKm)
+{
+    rayStartKm = 0.0;
+    rayEndKm = 0.0;
+
+    float planetRadiusKm =
+        _PlanetRadius *
+        0.001;
+
+    float innerRadiusKm =
+        planetRadiusKm +
+        _CloudBottom *
+        0.001;
+
+    float outerRadiusKm =
+        planetRadiusKm +
+        _CloudTop *
+        0.001;
+
+    float3 rayOriginKm =
+        (rayOriginWS - _PlanetCenter) *
+        0.001;
+
+    float2 innerHit =
+        RaySphereCenteredKm(
+            rayOriginKm,
+            rayDirection,
+            innerRadiusKm
+        );
+
+    float2 outerHit =
+        RaySphereCenteredKm(
+            rayOriginKm,
+            rayDirection,
+            outerRadiusKm
+        );
 
     if (outerHit.y <= 0.0)
     {
         return false;
     }
 
-    float cameraRadius = distance(rayOrigin, _PlanetCenter);
+    float cameraRadiusKm =
+        length(rayOriginKm);
 
-    if (cameraRadius < innerRadius)
+    if (cameraRadiusKm < innerRadiusKm)
     {
         if (innerHit.y <= 0.0)
         {
             return false;
         }
 
-        rayStart = innerHit.y;
-        rayEnd = outerHit.y;
+        rayStartKm =
+            innerHit.y;
+
+        rayEndKm =
+            outerHit.y;
     }
-    else if (cameraRadius < outerRadius)
+    else if (cameraRadiusKm < outerRadiusKm)
     {
-        rayStart = 0.0;
-        rayEnd = outerHit.y;
+        rayStartKm = 0.0;
+        rayEndKm = outerHit.y;
 
         if (innerHit.x > 0.0)
         {
-            rayEnd = min(rayEnd, innerHit.x);
+            rayEndKm =
+                min(
+                    rayEndKm,
+                    innerHit.x
+                );
         }
     }
     else
     {
-        rayStart = max(outerHit.x, 0.0);
-        rayEnd = outerHit.y;
+        rayStartKm =
+            max(
+                outerHit.x,
+                0.0
+            );
 
-        if (innerHit.x > rayStart && innerHit.x < rayEnd)
+        rayEndKm =
+            outerHit.y;
+
+        if (innerHit.x > rayStartKm &&
+            innerHit.x < rayEndKm)
         {
-            rayEnd = innerHit.x;
+            rayEndKm =
+                innerHit.x;
         }
     }
 
-    float2 planetHit = RaySphere(
-        rayOrigin,
-        rayDirection,
-        _PlanetCenter,
-        _PlanetRadius
-    );
+    float2 planetHit =
+        RaySphereCenteredKm(
+            rayOriginKm,
+            rayDirection,
+            planetRadiusKm
+        );
 
-    float planetDistance = GetNearestPositiveHit(planetHit);
+    float planetDistanceKm =
+        GetNearestPositiveHit(
+            planetHit
+        );
 
-    if (planetDistance <= rayStart)
+    if (planetDistanceKm <= rayStartKm)
     {
         return false;
     }
 
-    rayEnd = min(rayEnd, planetDistance);
-    return rayEnd > rayStart;
+    rayEndKm =
+        min(
+            rayEndKm,
+            planetDistanceKm
+        );
+
+    rayStartKm =
+        max(
+            rayStartKm,
+            0.0
+        );
+
+    rayEndKm =
+        max(
+            rayEndKm,
+            0.0
+        );
+
+    if (rayEndKm <= rayStartKm)
+    {
+        return false;
+    }
+
+    if (rayStartKm > _CloudTracingStartMaxDistanceKm)
+    {
+        return false;
+    }
+
+    float maxMarchDistanceKm =
+        max(
+            _CloudMaxTracingDistanceKm,
+            0.001
+        );
+
+    rayEndKm =
+        rayStartKm +
+        min(
+            maxMarchDistanceKm,
+            rayEndKm - rayStartKm
+        );
+
+    return rayEndKm > rayStartKm;
 }
 
 float GetCloudHeight01(float3 positionWS)
@@ -239,15 +352,7 @@ float GetCloudHeight01(float3 positionWS)
 
 float3 GetDensityPositionMeter(float3 positionWS)
 {
-    float heightAboveSurface =
-        distance(positionWS, _PlanetCenter) -
-        _PlanetRadius;
-
-    return float3(
-        positionWS.x - _PlanetCenter.x,
-        heightAboveSurface,
-        positionWS.z - _PlanetCenter.z
-    );
+    return positionWS - _PlanetCenter;
 }
 
 float SampleCloudDensityDataWS(
@@ -387,41 +492,47 @@ FlowerShadowResult VolumetricShadow(
     float outerRadius =
         _PlanetRadius + _CloudTop;
 
-    traceDirection = normalize(traceDirection);
+    traceDirection =
+        normalize(traceDirection);
 
     float3 rayOrigin =
         samplePositionWS +
-        traceDirection * 2.0;
+        traceDirection *
+        2.0;
 
-    float2 outerHit = RaySphere(
-        rayOrigin,
-        traceDirection,
-        _PlanetCenter,
-        outerRadius
-    );
+    float2 outerHit =
+        RaySphere(
+            rayOrigin,
+            traceDirection,
+            _PlanetCenter,
+            outerRadius
+        );
 
     if (outerHit.y <= 0.0)
     {
         return result;
     }
 
-    float traceDistance =
+    float traceDistanceKm =
         min(
-            max(_CloudLightBasicStepKm * 1000.0, 1.0),
-            outerHit.y
+            max(_CloudLightBasicStepKm, 0.001),
+            outerHit.y * 0.001
         );
 
-    float2 planetHit = RaySphere(
-        rayOrigin,
-        traceDirection,
-        _PlanetCenter,
-        _PlanetRadius
-    );
+    float2 planetHit =
+        RaySphere(
+            rayOrigin,
+            traceDirection,
+            _PlanetCenter,
+            _PlanetRadius
+        );
 
     float planetDistance =
-        GetNearestPositiveHit(planetHit);
+        GetNearestPositiveHit(
+            planetHit
+        );
 
-    if (planetDistance < traceDistance)
+    if (planetDistance * 0.001 < traceDistanceKm)
     {
         result.transmittance0 = 0.0;
         result.transmittance1 = 0.0;
@@ -451,17 +562,19 @@ FlowerShadowResult VolumetricShadow(
             inverseStepCount;
 
         float currentT =
-            shadowT * shadowT;
+            shadowT *
+            shadowT;
 
         float deltaT =
-            currentT - previousT;
+            currentT -
+            previousT;
 
-        float segmentLength =
+        float segmentLengthKm =
             deltaT *
-            traceDistance;
+            traceDistanceKm;
 
-        float sampleDistance =
-            traceDistance *
+        float sampleDistanceKm =
+            traceDistanceKm *
             (previousT + deltaT * 0.5);
 
         previousT =
@@ -470,7 +583,7 @@ FlowerShadowResult VolumetricShadow(
         float3 shadowSamplePosition =
             rayOrigin +
             traceDirection *
-            sampleDistance;
+            (sampleDistanceKm * 1000.0);
 
         float density =
             SampleCloudDensityWS(
@@ -478,8 +591,7 @@ FlowerShadowResult VolumetricShadow(
             );
 
         float extinction0 =
-            density *
-            _LightExtinction;
+            density;
 
         float extinction1 =
             extinction0 *
@@ -487,18 +599,18 @@ FlowerShadowResult VolumetricShadow(
 
         extinctionAccumulation0 +=
             extinction0 *
-            segmentLength;
+            segmentLengthKm;
 
         extinctionAccumulation1 +=
             extinction1 *
-            segmentLength;
+            segmentLengthKm;
     }
 
     result.transmittance0 =
-        exp(-extinctionAccumulation0);
+        exp(-extinctionAccumulation0 * 1000.0);
 
     result.transmittance1 =
-        exp(-extinctionAccumulation1);
+        exp(-extinctionAccumulation1 * 1000.0);
 
     return result;
 }
@@ -829,6 +941,35 @@ void CSMain(
         (float2(dispatchThreadID.xy) + 0.5) /
         float2(_OutputSize);
 
+    float sceneRawDepth =
+        SAMPLE_TEXTURE2D_X_LOD(
+            _CameraDepthTexture,
+            sampler_CameraDepthTexture,
+            uv,
+            0.0
+        ).r;
+
+#if UNITY_REVERSED_Z
+    bool hasSceneDepth =
+        sceneRawDepth > 0.000001;
+#else
+    bool hasSceneDepth =
+        sceneRawDepth < 0.999999;
+#endif
+
+    if (hasSceneDepth)
+    {
+        _CloudColorTexture[
+            dispatchThreadID.xy
+        ] = float4(0.0, 0.0, 0.0, 1.0);
+
+        _CloudDepthTexture[
+            dispatchThreadID.xy
+        ] = 0.0;
+
+        return;
+    }
+
     float3 rayDirection =
         GetWorldRayDirection(uv);
 
@@ -836,7 +977,7 @@ void CSMain(
     float rayEnd;
 
     bool intersectsCloud =
-        GetCloudRaySegment(
+        GetCloudRaySegmentKm(
             _CameraPositionWS,
             rayDirection,
             rayStart,
@@ -931,12 +1072,12 @@ void CSMain(
     float3 rayStartPosition =
         _CameraPositionWS +
         rayDirection *
-        rayStart;
+        (rayStart * 1000.0);
 
     float3 rayEndPosition =
         _CameraPositionWS +
         rayDirection *
-        rayEnd;
+        (rayEnd * 1000.0);
 
     float3 atmosphereTransmittanceStart =
         FlowerCloudSampleAtmosphereTransmittance(
@@ -979,7 +1120,7 @@ void CSMain(
         float3 samplePosition =
             _CameraPositionWS +
             rayDirection *
-            currentDistance;
+            (currentDistance * 1000.0);
 
         float3 samplePositionAtmosphereKm =
             FlowerCloudConvertToAtmosphereKm(
@@ -1008,13 +1149,13 @@ void CSMain(
             if (firstCloudDepth <= 0.0)
             {
                 firstCloudDepth =
-                    currentDistance;
+                    currentDistance *
+                    1000.0;
             }
 
             float sigmaE0 =
                 max(
-                    density *
-                    _ViewExtinction,
+                    density,
                     0.00000001
                 );
 
@@ -1035,7 +1176,8 @@ void CSMain(
 
             float opticalDepth =
                 sigmaE0 *
-                stepLength;
+                stepLength *
+                1000.0;
 
             float beerTransmittance =
                 exp(-opticalDepth);
@@ -1191,6 +1333,7 @@ void CSMain(
 
             weightedDepth +=
                 currentDistance *
+                1000.0 *
                 contribution;
 
             depthWeight +=

@@ -1,0 +1,204 @@
+#pragma kernel CSMain
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+TEXTURE2D_X(_CloudLowResColorTexture);
+SAMPLER(sampler_CloudLowResColorTexture);
+
+TEXTURE2D_X(_CloudLowResDepthTexture);
+SAMPLER(sampler_CloudLowResDepthTexture);
+
+TEXTURE2D_X(_CloudHistoryTexture);
+SAMPLER(sampler_CloudHistoryTexture);
+
+RWTexture2D<float4> _CloudReconstructionTexture;
+
+int2 _OutputSize;
+int2 _FullResolution;
+
+float3 _CameraPositionWS;
+float3 _CameraForwardWS;
+float3 _CameraRightWS;
+float3 _CameraUpWS;
+float _CameraTanHalfFov;
+float _CameraAspect;
+
+float4x4 _PreviousViewProjectionMatrix;
+float _TemporalBlend;
+int _FrameIndex;
+
+float3 GetWorldRayDirection(float2 uv)
+{
+    float2 ndc =
+        uv * 2.0 - 1.0;
+
+    float3 rayDirection =
+        _CameraForwardWS +
+        ndc.x *
+        _CameraRightWS *
+        (_CameraAspect * _CameraTanHalfFov) +
+        ndc.y *
+        _CameraUpWS *
+        _CameraTanHalfFov;
+
+    return normalize(rayDirection);
+}
+
+float4 ClampHistoryToCurrent(float4 historyColor, float4 currentColor)
+{
+    float3 minimumColor =
+        min(
+            historyColor.rgb,
+            currentColor.rgb
+        );
+
+    float3 maximumColor =
+        max(
+            historyColor.rgb,
+            currentColor.rgb
+        );
+
+    float3 margin =
+        abs(currentColor.rgb) *
+        0.35 +
+        0.05;
+
+    historyColor.rgb =
+        clamp(
+            historyColor.rgb,
+            minimumColor - margin,
+            maximumColor + margin
+        );
+
+    historyColor.a =
+        clamp(
+            historyColor.a,
+            currentColor.a - 0.25,
+            currentColor.a + 0.25
+        );
+
+    return historyColor;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_FullResolution.x ||
+        dispatchThreadID.y >= (uint)_FullResolution.y)
+    {
+        return;
+    }
+
+    float2 uv =
+        (float2(dispatchThreadID.xy) + 0.5) /
+        float2(_FullResolution);
+
+    float4 currentColor =
+        SAMPLE_TEXTURE2D_X_LOD(
+            _CloudLowResColorTexture,
+            sampler_CloudLowResColorTexture,
+            uv,
+            0.0
+        );
+
+    float cloudDepth =
+        SAMPLE_TEXTURE2D_X_LOD(
+            _CloudLowResDepthTexture,
+            sampler_CloudLowResDepthTexture,
+            uv,
+            0.0
+        ).r;
+
+    float temporalWeight =
+        saturate(_TemporalBlend);
+
+    if (_FrameIndex <= 0 ||
+        temporalWeight <= 0.0001 ||
+        cloudDepth <= 0.0001)
+    {
+        _CloudReconstructionTexture[dispatchThreadID.xy] =
+            currentColor;
+
+        return;
+    }
+
+    float3 rayDirection =
+        GetWorldRayDirection(uv);
+
+    float3 worldPosition =
+        _CameraPositionWS +
+        rayDirection *
+        cloudDepth;
+
+    float4 previousClip =
+        mul(
+            _PreviousViewProjectionMatrix,
+            float4(worldPosition, 1.0)
+        );
+
+    float2 historyUV =
+        uv;
+
+    if (abs(previousClip.w) > 0.00001)
+    {
+        float2 previousNDC =
+            previousClip.xy /
+            previousClip.w;
+
+        float2 projectedUV =
+            previousNDC * 0.5 + 0.5;
+
+        if (all(projectedUV >= 0.0) &&
+            all(projectedUV <= 1.0))
+        {
+            historyUV =
+                projectedUV;
+        }
+        else
+        {
+            temporalWeight = 0.0;
+        }
+    }
+    else
+    {
+        temporalWeight = 0.0;
+    }
+
+    float4 historyColor =
+        SAMPLE_TEXTURE2D_X_LOD(
+            _CloudHistoryTexture,
+            sampler_CloudHistoryTexture,
+            historyUV,
+            0.0
+        );
+
+    historyColor =
+        ClampHistoryToCurrent(
+            historyColor,
+            currentColor
+        );
+
+    float4 result =
+        lerp(
+            currentColor,
+            historyColor,
+            temporalWeight
+        );
+
+    result =
+        lerp(
+            result,
+            currentColor,
+            1.0 - saturate(currentColor.a)
+        );
+
+    if (any(isnan(result)) ||
+        any(isinf(result)))
+    {
+        result =
+            currentColor;
+    }
+
+    _CloudReconstructionTexture[dispatchThreadID.xy] =
+        result;
+}
