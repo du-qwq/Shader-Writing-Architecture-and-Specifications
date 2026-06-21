@@ -56,7 +56,7 @@ float _CloudTop;
 
 float _CloudCoverage;
 float _CloudDensity;
-float _CloudWeatherUVScale;
+float2 _CloudWeatherUVScale;
 
 float4 _CloudBasicNoiseScale;
 float4 _CloudDetailNoiseScale;
@@ -68,15 +68,13 @@ int _LightStepCount;
 
 float _ViewExtinction;
 float _LightExtinction;
-float _LightTraceDistance;
+float _CloudLightBasicStepKm;
 
 float3 _SunDirection;
 float3 _SunColor;
-float _SunIntensity;
 float _SunLightScale;
 
-float3 _AmbientColor;
-float _AmbientStrength;
+float _CloudAmbientScale;
 float3 _CloudAlbedo;
 
 float _PhaseForward;
@@ -90,8 +88,7 @@ int _EnablePowder;
 float _PowderPow;
 float _PowderScale;
 
-int _EnableAmbientTrace;
-float _AmbientTraceStrength;
+int _EnableGroundContribution;
 
 #include "../Includes/FlowerCloudDensityCommon.hlsl"
 #include "../Includes/FlowerAtmosphereCommon.hlsl"
@@ -410,7 +407,7 @@ FlowerShadowResult VolumetricShadow(
 
     float traceDistance =
         min(
-            max(_LightTraceDistance, 1.0),
+            max(_CloudLightBasicStepKm * 1000.0, 1.0),
             outerHit.y
         );
 
@@ -967,7 +964,6 @@ void CSMain(
 
     float3 baseSunlightTerm =
         _SunColor *
-        _SunIntensity *
         _SunLightScale;
 
     [loop]
@@ -1105,7 +1101,7 @@ void CSMain(
             // Flower additionally traces upward for ambient visibility.
             // The original source radiance comes from sky/distant-light data.
             // Until those systems are ported, Unity uses Ambient Color as the source.
-            if (_EnableAmbientTrace != 0)
+            if (_EnableGroundContribution != 0)
             {
                 FlowerShadowResult ambientShadow =
                     VolumetricShadow(
@@ -1126,7 +1122,6 @@ void CSMain(
 
                 float3 ambientTraceLuminance =
                     groundToCloudTransfer *
-                    _AmbientTraceStrength *
                     powderEffect *
                     horizonContribution *
                     lerp(
@@ -1147,12 +1142,9 @@ void CSMain(
                     ambientTraceLuminance;
             }
 
-            if (layerIndex == 0)
-            {
-                sunLuminance0 +=
-                    distantLit *
-                    _AmbientStrength;
-            }
+            sunLuminance0 +=
+                distantLit *
+                _CloudAmbientScale;
 
             // Flower integrates higher-order scattering first.
             float3 scatterSource1 =

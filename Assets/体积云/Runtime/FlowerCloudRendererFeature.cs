@@ -16,13 +16,8 @@ namespace FlowerClouds
             public Shader compositeShader;
 
             [Header("Lighting")]
-            public Color ambientColor = new Color(0.25f, 0.35f, 0.55f, 1.0f);
-
-            [Range(0.0f, 10.0f)]
-            public float sunIntensity = 1.5f;
-
             [Range(0.0f, 2.0f)]
-            public float ambientStrength = 0.25f;
+            public float cloudAmbientScale = 0.25f;
 
             [Header("Flower Lighting")]
             [ColorUsage(false, true)]
@@ -31,8 +26,8 @@ namespace FlowerClouds
             [Range(0.0f, 50.0f)]
             public float sunLightScale = 10.0f;
 
-            [Min(100.0f)]
-            public float lightTraceDistance = 15000.0f;
+            [Min(0.1f)]
+            public float cloudLightBasicStepKm = 15.0f;
 
             [Range(0.01f, 1.0f)]
             public float multiScatterExtinction = 0.5f;
@@ -49,11 +44,8 @@ namespace FlowerClouds
             [Range(0.05f, 2.0f)]
             public float powderScale = 1.0f;
 
-            [Header("Ambient Trace")]
-            public bool enableAmbientTrace = true;
-
-            [Range(0.0f, 4.0f)]
-            public float ambientTraceStrength = 0.35f;
+            [Header("Ground Contribution")]
+            public bool enableGroundContribution = true;
 
             [Header("Planet")]
             public Vector3 planetCenter = new Vector3(0.0f, -6371000.0f, 0.0f);
@@ -68,8 +60,7 @@ namespace FlowerClouds
             [Range(0.0f, 10.0f)]
             public float cloudDensity = 1.0f;
 
-            [Range(0.001f, 1.0f)]
-            public float weatherUVScale = 0.03f;
+            public Vector2 weatherUVScale = new Vector2(0.03f, 0.03f);
 
             public Vector3 basicNoiseScale = new Vector3(0.15f, 0.15f, 0.15f);
             public Vector3 detailNoiseScale = new Vector3(0.8f, 0.8f, 0.8f);
@@ -266,8 +257,8 @@ namespace FlowerClouds
             private static readonly int LightExtinctionID =
                 Shader.PropertyToID("_LightExtinction");
 
-            private static readonly int LightTraceDistanceID =
-                Shader.PropertyToID("_LightTraceDistance");
+            private static readonly int CloudLightBasicStepKmID =
+                Shader.PropertyToID("_CloudLightBasicStepKm");
 
             private static readonly int MultiScatterExtinctionID =
                 Shader.PropertyToID("_MultiScatterExtinction");
@@ -290,11 +281,8 @@ namespace FlowerClouds
             private static readonly int PowderScaleID =
                 Shader.PropertyToID("_PowderScale");
 
-            private static readonly int EnableAmbientTraceID =
-                Shader.PropertyToID("_EnableAmbientTrace");
-
-            private static readonly int AmbientTraceStrengthID =
-                Shader.PropertyToID("_AmbientTraceStrength");
+            private static readonly int EnableGroundContributionID =
+                Shader.PropertyToID("_EnableGroundContribution");
 
             private static readonly int SunDirectionID =
                 Shader.PropertyToID("_SunDirection");
@@ -302,14 +290,8 @@ namespace FlowerClouds
             private static readonly int SunColorID =
                 Shader.PropertyToID("_SunColor");
 
-            private static readonly int SunIntensityID =
-                Shader.PropertyToID("_SunIntensity");
-
-            private static readonly int AmbientColorID =
-                Shader.PropertyToID("_AmbientColor");
-
-            private static readonly int AmbientStrengthID =
-                Shader.PropertyToID("_AmbientStrength");
+            private static readonly int CloudAmbientScaleID =
+                Shader.PropertyToID("_CloudAmbientScale");
 
             private static readonly int PhaseForwardID =
                 Shader.PropertyToID("_PhaseForward");
@@ -634,7 +616,7 @@ namespace FlowerClouds
                         settings.cloudDensity
                     );
 
-                    commandBuffer.SetComputeFloatParam(
+                    commandBuffer.SetComputeVectorParam(
                         settings.raymarchCompute,
                         CloudWeatherUVScaleID,
                         settings.weatherUVScale
@@ -690,8 +672,8 @@ namespace FlowerClouds
 
                     commandBuffer.SetComputeFloatParam(
                         settings.raymarchCompute,
-                        LightTraceDistanceID,
-                        settings.lightTraceDistance
+                        CloudLightBasicStepKmID,
+                        settings.cloudLightBasicStepKm
                     );
 
                     commandBuffer.SetComputeFloatParam(
@@ -738,14 +720,8 @@ namespace FlowerClouds
 
                     commandBuffer.SetComputeIntParam(
                         settings.raymarchCompute,
-                        EnableAmbientTraceID,
-                        settings.enableAmbientTrace ? 1 : 0
-                    );
-
-                    commandBuffer.SetComputeFloatParam(
-                        settings.raymarchCompute,
-                        AmbientTraceStrengthID,
-                        settings.ambientTraceStrength
+                        EnableGroundContributionID,
+                        settings.enableGroundContribution ? 1 : 0
                     );
 
                     commandBuffer.SetComputeVectorParam(
@@ -762,20 +738,8 @@ namespace FlowerClouds
 
                     commandBuffer.SetComputeFloatParam(
                         settings.raymarchCompute,
-                        SunIntensityID,
-                        settings.sunIntensity
-                    );
-
-                    commandBuffer.SetComputeVectorParam(
-                        settings.raymarchCompute,
-                        AmbientColorID,
-                        settings.ambientColor.linear
-                    );
-
-                    commandBuffer.SetComputeFloatParam(
-                        settings.raymarchCompute,
-                        AmbientStrengthID,
-                        settings.ambientStrength
+                        CloudAmbientScaleID,
+                        settings.cloudAmbientScale
                     );
 
                     commandBuffer.SetComputeFloatParam(
