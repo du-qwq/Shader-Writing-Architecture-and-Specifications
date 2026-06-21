@@ -1,0 +1,167 @@
+#pragma kernel CSMain
+
+#define LUT_SAMPLE_COUNT 64
+
+RWTexture2D<float4> Result;
+
+int _LutWidth;
+int _LutHeight;
+
+float _PlanetRadius;
+float _AtmosphereHeight;
+float _RayleighScaleHeight;
+float _MieScaleHeight;
+
+float3 RayleighCoefficient(float h)
+{
+    float3 sigma = float3(5.802, 13.558, 33.1) * 1e-6;
+    float rho = exp(-h / _RayleighScaleHeight);
+    return sigma * rho;
+}
+
+float3 MieCoefficient(float h)
+{
+    float3 sigma = float3(3.996,3.996,3.996)*1e-6;
+    float rho = exp(-h / _MieScaleHeight);
+    return sigma * rho;
+}
+
+float3 MieAbsorption(float h)
+{
+    float3 sigma = float3(4.4, 4.4, 4.4) * 1e-6;
+    float rho = exp(-h / _MieScaleHeight);
+    return sigma * rho;
+}
+
+float3 OzoneAbsorption(float h)
+{
+    float3 sigma = float3(0.650, 1.881, 0.085) * 1e-6;
+
+    float center = 25000.0;
+    float width = 15000.0;
+
+    float rho = max(0.0, 1.0 - abs(h - center) / width);
+
+    return sigma * rho;
+}
+
+float3 ExtinctionCoefficient(float h)
+{
+    float3 scattering = RayleighCoefficient(h) + MieCoefficient(h);
+    float3 absorption = MieAbsorption(h) + OzoneAbsorption(h);
+
+    return scattering + absorption;
+}
+
+float2 RaySphere(float3 rayOrigin, float3 rayDir, float sphereRadius)
+{
+    float3 oc = rayOrigin;
+
+    float b = dot(oc, rayDir);
+    float c = dot(oc, oc) - sphereRadius * sphereRadius;
+
+    float h = b * b - c;
+
+    if (h < 0.0)
+    {
+        return float2(-1.0, -1.0);
+    }
+
+    h = sqrt(h);
+
+    return float2(-b - h, -b + h);
+}
+
+float GetHeight(float3 p)
+{
+    return max(0.0, length(p) - _PlanetRadius);
+}
+
+float3 TransmittanceToAtmosphere(float3 p, float3 dir)
+{
+    float atmosphereRadius = _PlanetRadius + _AtmosphereHeight;
+
+    float2 groundHit = RaySphere(p, dir, _PlanetRadius);
+    if (groundHit.x > 0.0)
+    {
+        return 0.0;
+    }
+
+    float2 atmosphereHit = RaySphere(p, dir, atmosphereRadius);
+    if (atmosphereHit.y < 0.0)
+    {
+        return 0.0;
+    }
+
+    float tEnd = atmosphereHit.y;
+    float ds = tEnd / LUT_SAMPLE_COUNT;
+
+    float3 sum = 0.0;
+    float3 sampleP = p + dir * ds * 0.5;
+
+    [loop]
+    for (int i = 0; i < LUT_SAMPLE_COUNT; i++)
+    {
+        float h = GetHeight(sampleP);
+        float3 extinction = ExtinctionCoefficient(h);
+
+        sum += extinction * ds;
+        sampleP += dir * ds;
+    }
+
+    return exp(-sum);
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _LutWidth || id.y >= _LutHeight)
+    {
+        return;
+    }
+
+    float2 uv = (float2(id.xy) + 0.5) / float2(_LutWidth, _LutHeight);
+
+    float bottomRadius = _PlanetRadius;
+    float topRadius = _PlanetRadius + _AtmosphereHeight;
+
+    float H = sqrt(max(0.0, topRadius * topRadius - bottomRadius * bottomRadius));
+
+    // uv.y -> rho -> r
+    float rho = uv.y * H;
+    float r = sqrt(rho * rho + bottomRadius * bottomRadius);
+
+    // 当前高度下，最短和最长到大气顶的距离
+    float dMin = topRadius - r;
+    float dMax = rho + H;
+
+    // uv.x -> d
+    float d = dMin + uv.x * (dMax - dMin);
+
+    // 由 d 反推出 mu
+    // d 是从当前点沿 dir 到大气顶的距离
+    // 根据 |p + d * dir| = topRadius
+    // 可推得：mu = (topRadius^2 - r^2 - d^2) / (2rd)
+    float mu;
+
+    if (d <= 0.0001)
+    {
+        mu = 1.0;
+    }
+    else
+    {
+        mu = (topRadius * topRadius - r * r - d * d) / (2.0 * r * d);
+        mu = clamp(mu, -1.0, 1.0);
+    }
+
+    // 固定采样点在 y 轴上
+    float3 p = float3(0.0, r, 0.0);
+
+    // 构造和 up=(0,1,0) 点乘为 mu 的方向
+    float sinTheta = sqrt(max(0.0, 1.0 - mu * mu));
+    float3 dir = normalize(float3(sinTheta, mu, 0.0));
+
+    float3 T = TransmittanceToAtmosphere(p, dir);
+
+    Result[id.xy] = float4(T, 1.0);
+}

@@ -1,0 +1,600 @@
+#pragma kernel GenerateTransmittance
+#pragma kernel GenerateMultiScatter
+#pragma kernel GenerateSkyCapture
+#pragma kernel GenerateSkyIrradiance
+#pragma kernel GenerateCloudDistantLit
+#pragma kernel GenerateFroxelScatter
+#pragma kernel GenerateDistantLitGrid
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+TEXTURE2D(_FlowerAtmosphereTransmittance);
+SAMPLER(sampler_FlowerAtmosphereTransmittance);
+
+TEXTURE2D(_FlowerAtmosphereMultiScatter);
+SAMPLER(sampler_FlowerAtmosphereMultiScatter);
+
+TEXTURE2D_ARRAY(_FlowerAtmosphereSkyCapture);
+SAMPLER(sampler_FlowerAtmosphereSkyCapture);
+
+RWTexture2D<float4> _FlowerAtmosphereTransmittanceRW;
+RWTexture2D<float4> _FlowerAtmosphereMultiScatterRW;
+RWTexture2DArray<float4> _FlowerAtmosphereSkyCaptureRW;
+RWTexture2DArray<float4> _FlowerSkyIrradianceRW;
+RWTexture2D<float4> _FlowerCloudDistantLitRW;
+RWTexture3D<float4> _FlowerFroxelScatterRW;
+RWTexture3D<float4> _FlowerDistantLitGridRW;
+
+int2 _TransmittanceSize;
+int2 _MultiScatterSize;
+int2 _SkyCaptureSize;
+int2 _SkyIrradianceSize;
+int2 _CloudDistantLitSize;
+int3 _FroxelSize;
+int3 _DistantGridSize;
+
+float3 _CameraPositionAtmosphere;
+float3 _CameraForwardWS;
+float3 _CameraRightWS;
+float3 _CameraUpWS;
+float _CameraTanHalfFov;
+float _CameraAspect;
+
+float _MiePhaseG;
+int _SkyIrradianceSamples;
+int _DistantDirectionSamples;
+
+#include "../Includes/FlowerAtmosphereCommon.hlsl"
+
+float3 GetCameraRayDirection(float2 uv)
+{
+    float2 ndc = uv * 2.0 - 1.0;
+
+    return normalize(
+        _CameraForwardWS +
+        ndc.x * _CameraRightWS * (_CameraAspect * _CameraTanHalfFov) +
+        ndc.y * _CameraUpWS * _CameraTanHalfFov
+    );
+}
+
+[numthreads(8, 8, 1)]
+void GenerateTransmittance(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_TransmittanceSize.x ||
+        dispatchThreadID.y >= (uint)_TransmittanceSize.y)
+    {
+        return;
+    }
+
+    float2 uv =
+        (float2(dispatchThreadID.xy) + 0.5) /
+        float2(_TransmittanceSize);
+
+    float radius;
+    float mu;
+
+    FlowerAtmosphereTransmittanceParamsFromUv(
+        uv,
+        radius,
+        mu
+    );
+
+    float3 origin = float3(0.0, radius, 0.0);
+    float sinTheta = sqrt(saturate(1.0 - mu * mu));
+    float3 direction = float3(sinTheta, mu, 0.0);
+
+    float distance = FlowerAtmosphereDistanceToBoundary(origin, direction);
+
+    float3 opticalDepth = FlowerAtmosphereIntegrateOpticalDepth(
+        origin,
+        direction,
+        distance,
+        max(_AtmosphereIntegrationSteps, 40)
+    );
+
+    float3 transmittance = exp(-opticalDepth);
+
+    _FlowerAtmosphereTransmittanceRW[dispatchThreadID.xy] =
+        float4(transmittance, 1.0);
+}
+
+[numthreads(1, 1, 1)]
+void GenerateMultiScatter(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_MultiScatterSize.x ||
+        dispatchThreadID.y >= (uint)_MultiScatterSize.y)
+    {
+        return;
+    }
+
+    float2 uv =
+        (float2(dispatchThreadID.xy) + 0.5) /
+        float2(_MultiScatterSize);
+
+    float sunMu = uv.x * 2.0 - 1.0;
+    float height = uv.y * (_AtmosphereTopRadius - _AtmosphereBottomRadius);
+    float radius = _AtmosphereBottomRadius + height;
+
+    float3 origin = float3(0.0, radius, 0.0);
+    float3 sunDirection = normalize(
+        float3(
+            sqrt(saturate(1.0 - sunMu * sunMu)),
+            sunMu,
+            0.0
+        )
+    );
+
+    int directionCount = 64;
+    float3 accumulatedLuminance = 0.0;
+    float3 accumulatedScatteringRatio = 0.0;
+
+    [loop]
+    for (int directionIndex = 0;
+         directionIndex < FLOWER_ATMOSPHERE_MAX_DIRECTIONS;
+         directionIndex++)
+    {
+        if (directionIndex >= directionCount)
+        {
+            break;
+        }
+
+        float3 direction = FlowerAtmosphereUniformSphereDirection(
+            directionIndex,
+            directionCount
+        );
+
+        float distance = FlowerAtmosphereDistanceToBoundary(origin, direction);
+
+        if (distance <= 0.0)
+        {
+            continue;
+        }
+
+        int stepCount = 20;
+        float stepLength = distance / stepCount;
+        float currentDistance = stepLength * 0.5;
+        float3 viewTransmittance = 1.0;
+        float3 directionLuminance = 0.0;
+        float3 directionScatter = 0.0;
+
+        [loop]
+        for (int stepIndex = 0;
+             stepIndex < FLOWER_ATMOSPHERE_MAX_STEPS;
+             stepIndex++)
+        {
+            if (stepIndex >= stepCount)
+            {
+                break;
+            }
+
+            float3 samplePosition = origin + direction * currentDistance;
+
+            float3 scattering;
+            float3 extinction;
+            float3 rayleighScattering;
+            float3 mieScattering;
+
+            FlowerAtmosphereMedium(
+                samplePosition,
+                scattering,
+                extinction,
+                rayleighScattering,
+                mieScattering
+            );
+
+            float3 sunTransmittance = FlowerAtmosphereSampleTransmittance(
+                _FlowerAtmosphereTransmittance,
+                sampler_FlowerAtmosphereTransmittance,
+                samplePosition,
+                sunDirection
+            );
+
+            float3 stepTransmittance = exp(-extinction * stepLength);
+
+            float3 source =
+                sunTransmittance *
+                _AtmosphereSunLuminance *
+                scattering;
+
+            float3 integratedSource =
+                (source - source * stepTransmittance) /
+                max(extinction, 0.0000001);
+
+            directionLuminance += viewTransmittance * integratedSource;
+
+            float3 integratedScatter =
+                (scattering - scattering * stepTransmittance) /
+                max(extinction, 0.0000001);
+
+            directionScatter += viewTransmittance * integratedScatter;
+
+            viewTransmittance *= stepTransmittance;
+            currentDistance += stepLength;
+        }
+
+        accumulatedLuminance += directionLuminance;
+        accumulatedScatteringRatio += directionScatter;
+    }
+
+    float isotropicPhase = 1.0 / (4.0 * FLOWER_ATMOSPHERE_PI);
+
+    float3 averageLuminance =
+        accumulatedLuminance / directionCount *
+        isotropicPhase;
+
+    float3 averageScatteringRatio =
+        accumulatedScatteringRatio / directionCount *
+        isotropicPhase;
+
+    float3 infiniteSeries =
+        1.0 / max(1.0 - averageScatteringRatio, 0.001);
+
+    float3 result =
+        averageLuminance *
+        infiniteSeries *
+        _MultipleScatteringFactor;
+
+    _FlowerAtmosphereMultiScatterRW[dispatchThreadID.xy] =
+        float4(max(result, 0.0), 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void GenerateSkyCapture(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_SkyCaptureSize.x ||
+        dispatchThreadID.y >= (uint)_SkyCaptureSize.y ||
+        dispatchThreadID.z >= 6)
+    {
+        return;
+    }
+
+    float2 uv =
+        (float2(dispatchThreadID.xy) + 0.5) /
+        float2(_SkyCaptureSize);
+
+    float3 direction =
+        FlowerAtmosphereCubeDirection(
+            dispatchThreadID.z,
+            uv
+        );
+
+    float maximumDistance =
+        FlowerAtmosphereDistanceToBoundary(
+            _CameraPositionAtmosphere,
+            direction
+        );
+
+    FlowerAtmosphereIntegrationResult integration =
+        FlowerAtmosphereIntegrateScattering(
+            _FlowerAtmosphereTransmittance,
+            sampler_FlowerAtmosphereTransmittance,
+            _FlowerAtmosphereMultiScatter,
+            sampler_FlowerAtmosphereMultiScatter,
+            _CameraPositionAtmosphere,
+            direction,
+            maximumDistance,
+            _AtmosphereSunDirection,
+            _AtmosphereSunLuminance,
+            max(_AtmosphereIntegrationSteps, 32),
+            true,
+            _MiePhaseG
+        );
+
+    _FlowerAtmosphereSkyCaptureRW[
+        uint3(dispatchThreadID.xy, dispatchThreadID.z)
+    ] = float4(integration.scatteredLight, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void GenerateSkyIrradiance(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_SkyIrradianceSize.x ||
+        dispatchThreadID.y >= (uint)_SkyIrradianceSize.y ||
+        dispatchThreadID.z >= 6)
+    {
+        return;
+    }
+
+    float2 uv =
+        (float2(dispatchThreadID.xy) + 0.5) /
+        float2(_SkyIrradianceSize);
+
+    float3 normal =
+        FlowerAtmosphereCubeDirection(
+            dispatchThreadID.z,
+            uv
+        );
+
+    int sampleCount = clamp(
+        _SkyIrradianceSamples,
+        1,
+        FLOWER_ATMOSPHERE_MAX_DIRECTIONS
+    );
+
+    float3 irradiance = 0.0;
+
+    [loop]
+    for (int sampleIndex = 0;
+         sampleIndex < FLOWER_ATMOSPHERE_MAX_DIRECTIONS;
+         sampleIndex++)
+    {
+        if (sampleIndex >= sampleCount)
+        {
+            break;
+        }
+
+        float3 sampleDirection =
+            FlowerAtmosphereCosineHemisphereDirection(
+                sampleIndex,
+                sampleCount,
+                normal
+            );
+
+        uint faceIndex;
+        float2 sampleUv;
+
+        FlowerAtmosphereDirectionToCubeUv(
+            sampleDirection,
+            faceIndex,
+            sampleUv
+        );
+
+        float3 skyRadiance =
+            _FlowerAtmosphereSkyCapture.SampleLevel(
+                sampler_FlowerAtmosphereSkyCapture,
+                float3(sampleUv, faceIndex),
+                0.0
+            ).rgb;
+
+        irradiance += skyRadiance;
+    }
+
+    irradiance *= FLOWER_ATMOSPHERE_PI / sampleCount;
+
+    _FlowerSkyIrradianceRW[
+        uint3(dispatchThreadID.xy, dispatchThreadID.z)
+    ] = float4(irradiance, 1.0);
+}
+
+[numthreads(8, 1, 1)]
+void GenerateCloudDistantLit(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_CloudDistantLitSize.x)
+    {
+        return;
+    }
+
+    float heightKm =
+        (
+            FLOWER_DISTANT_SKY_LIT_MAX_METER *
+            0.001
+        ) *
+        (dispatchThreadID.x + 0.5) /
+        _CloudDistantLitSize.x;
+
+    float3 origin =
+        float3(
+            0.0,
+            _AtmosphereBottomRadius + heightKm,
+            0.0
+        );
+
+    int directionCount = clamp(
+        _DistantDirectionSamples,
+        1,
+        FLOWER_ATMOSPHERE_MAX_DIRECTIONS
+    );
+
+    float3 averageLight = 0.0;
+
+    [loop]
+    for (int directionIndex = 0;
+         directionIndex < FLOWER_ATMOSPHERE_MAX_DIRECTIONS;
+         directionIndex++)
+    {
+        if (directionIndex >= directionCount)
+        {
+            break;
+        }
+
+        float3 direction =
+            FlowerAtmosphereUniformSphereDirection(
+                directionIndex,
+                directionCount
+            );
+
+        float maximumDistance =
+            FlowerAtmosphereDistanceToBoundary(
+                origin,
+                direction
+            );
+
+        FlowerAtmosphereIntegrationResult integration =
+            FlowerAtmosphereIntegrateScattering(
+                _FlowerAtmosphereTransmittance,
+                sampler_FlowerAtmosphereTransmittance,
+                _FlowerAtmosphereMultiScatter,
+                sampler_FlowerAtmosphereMultiScatter,
+                origin,
+                direction,
+                maximumDistance,
+                _AtmosphereSunDirection,
+                _AtmosphereSunLuminance,
+                10,
+                false,
+                _MiePhaseG
+            );
+
+        averageLight += integration.scatteredLight;
+    }
+
+    averageLight /= directionCount;
+
+    _FlowerCloudDistantLitRW[
+        int2(dispatchThreadID.x, 0)
+    ] = float4(averageLight, 1.0);
+}
+
+[numthreads(4, 4, 1)]
+void GenerateFroxelScatter(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_FroxelSize.x ||
+        dispatchThreadID.y >= (uint)_FroxelSize.y ||
+        dispatchThreadID.z >= (uint)_FroxelSize.z)
+    {
+        return;
+    }
+
+    float2 uv =
+        (float2(dispatchThreadID.xy) + 0.5) /
+        float2(_FroxelSize.xy);
+
+    float3 direction = GetCameraRayDirection(uv);
+
+    float slice =
+        (dispatchThreadID.z + 0.5) /
+        (float)_FroxelSize.z;
+
+    slice *= slice;
+    slice *= _FroxelSize.z;
+
+    float maximumDistance =
+        FlowerAerialPerspectiveSliceToDepth(
+            slice
+        );
+
+    FlowerAtmosphereIntegrationResult integration =
+        FlowerAtmosphereIntegrateScattering(
+            _FlowerAtmosphereTransmittance,
+            sampler_FlowerAtmosphereTransmittance,
+            _FlowerAtmosphereMultiScatter,
+            sampler_FlowerAtmosphereMultiScatter,
+            _CameraPositionAtmosphere,
+            direction,
+            maximumDistance,
+            _AtmosphereSunDirection,
+            _AtmosphereSunLuminance,
+            max(1, (int)((dispatchThreadID.z + 1) * 2)),
+            true,
+            _MiePhaseG
+        );
+
+    float opacity =
+        1.0 -
+        dot(
+            integration.transmittance,
+            float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+        );
+
+    _FlowerFroxelScatterRW[dispatchThreadID] =
+        float4(
+            integration.scatteredLight,
+            saturate(opacity)
+        );
+}
+
+[numthreads(4, 4, 1)]
+void GenerateDistantLitGrid(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_DistantGridSize.x ||
+        dispatchThreadID.y >= (uint)_DistantGridSize.y ||
+        dispatchThreadID.z >= (uint)_DistantGridSize.z)
+    {
+        return;
+    }
+
+    float2 uv =
+        (float2(dispatchThreadID.xy) + 0.5) /
+        float2(_DistantGridSize.xy);
+
+    float3 cameraDirection =
+        GetCameraRayDirection(uv);
+
+    float slice =
+        (dispatchThreadID.z + 0.5) /
+        (float)_DistantGridSize.z;
+
+    slice *= slice;
+    slice *= _DistantGridSize.z;
+
+    float cameraDistance =
+        FlowerDistantGridSliceToDepth(
+            slice
+        );
+
+    float3 voxelPosition =
+        _CameraPositionAtmosphere +
+        cameraDirection *
+        cameraDistance;
+
+    float voxelRadius = length(voxelPosition);
+
+    if (voxelRadius <= _AtmosphereBottomRadius)
+    {
+        voxelPosition =
+            voxelPosition /
+            max(voxelRadius, 0.0001) *
+            (_AtmosphereBottomRadius + 1.0);
+    }
+
+    int directionCount = clamp(
+        _DistantDirectionSamples,
+        1,
+        FLOWER_ATMOSPHERE_MAX_DIRECTIONS
+    );
+
+    float3 averageLight = 0.0;
+    float3 averageTransmittance = 0.0;
+
+    [loop]
+    for (int directionIndex = 0;
+         directionIndex < FLOWER_ATMOSPHERE_MAX_DIRECTIONS;
+         directionIndex++)
+    {
+        if (directionIndex >= directionCount)
+        {
+            break;
+        }
+
+        float3 direction =
+            FlowerAtmosphereUniformSphereDirection(
+                directionIndex,
+                directionCount
+            );
+
+        FlowerAtmosphereIntegrationResult integration =
+            FlowerAtmosphereIntegrateScattering(
+                _FlowerAtmosphereTransmittance,
+                sampler_FlowerAtmosphereTransmittance,
+                _FlowerAtmosphereMultiScatter,
+                sampler_FlowerAtmosphereMultiScatter,
+                voxelPosition,
+                direction,
+                cameraDistance,
+                _AtmosphereSunDirection,
+                _AtmosphereSunLuminance,
+                max(1, (int)((dispatchThreadID.z + 1) * 2)),
+                false,
+                _MiePhaseG
+            );
+
+        averageLight += integration.scatteredLight;
+        averageTransmittance += integration.transmittance;
+    }
+
+    averageLight /= directionCount;
+    averageTransmittance /= directionCount;
+
+    float opacity =
+        1.0 -
+        dot(
+            averageTransmittance,
+            float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+        );
+
+    _FlowerDistantLitGridRW[dispatchThreadID] =
+        float4(
+            averageLight,
+            saturate(opacity)
+        );
+}

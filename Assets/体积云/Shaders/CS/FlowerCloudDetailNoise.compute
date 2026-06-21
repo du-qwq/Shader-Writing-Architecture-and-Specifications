@@ -1,0 +1,38 @@
+#pragma kernel CSMain
+
+#include "../Includes/FlowerCloudNoiseCommon.hlsl"
+
+#define FLOWER_DETAIL_FREQUENCY 8.0
+
+RWTexture3D<float> _DetailNoise;
+int3 _TextureSize;
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (any(dispatchThreadID >= (uint3)_TextureSize))
+    {
+        return;
+    }
+
+    float3 uvw =
+        (float3(dispatchThreadID) + 0.5)
+        / float3(_TextureSize);
+
+    float detailNoise =
+        FlowerWorleyFBM(
+            uvw,
+            FLOWER_DETAIL_FREQUENCY
+        ) * 0.625
+        + FlowerWorleyFBM(
+            uvw,
+            FLOWER_DETAIL_FREQUENCY * 2.0
+        ) * 0.25
+        + FlowerWorleyFBM(
+            uvw,
+            FLOWER_DETAIL_FREQUENCY * 4.0
+        ) * 0.125;
+
+    _DetailNoise[dispatchThreadID] =
+        saturate(detailNoise);
+}

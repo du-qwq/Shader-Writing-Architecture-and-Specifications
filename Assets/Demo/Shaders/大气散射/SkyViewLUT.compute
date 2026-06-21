@@ -1,0 +1,292 @@
+#pragma kernel CSMain
+
+#define PI 3.14159265359
+#define VIEW_SAMPLE_COUNT 24
+
+RWTexture2D<float4> Result;
+
+Texture2D<float4> _TransmittanceLut;
+SamplerState sampler_TransmittanceLut;
+
+Texture2D<float4> _MultiScatteringLut;
+SamplerState sampler_MultiScatteringLut;
+
+int _LutWidth;
+int _LutHeight;
+
+float _PlanetRadius;
+float _AtmosphereHeight;
+float _RayleighScaleHeight;
+float _MieScaleHeight;
+float _MieG;
+float _SunIntensity;
+float _CameraHeight;
+float _MultiScatteringContribution;
+
+float3 _SunDirWS;
+
+float2 RaySphere(float3 rayOrigin, float3 rayDir, float sphereRadius)
+{
+    float3 oc = rayOrigin;
+
+    float b = dot(oc, rayDir);
+    float c = dot(oc, oc) - sphereRadius * sphereRadius;
+
+    float h = b * b - c;
+
+    if (h < 0.0)
+    {
+        return float2(-1.0, -1.0);
+    }
+
+    h = sqrt(h);
+
+    return float2(-b - h, -b + h);
+}
+
+float GetHeight(float3 p)
+{
+    return max(0.0, length(p) - _PlanetRadius);
+}
+
+float3 RayleighCoefficient(float h)
+{
+    float3 sigma = float3(5.802, 13.558, 33.1) * 1e-6;
+    float rho = exp(-h / _RayleighScaleHeight);
+    return sigma * rho;
+}
+
+float RayleighPhase(float cosTheta)
+{
+    return 3.0 / (16.0 * PI) * (1.0 + cosTheta * cosTheta);
+}
+
+float3 MieCoefficient(float h)
+{
+    float3 sigma = float3(3.996, 3.996, 3.996) * 1e-6;
+    float rho = exp(-h / _MieScaleHeight);
+    return sigma * rho;
+}
+
+float MiePhase(float cosTheta)
+{
+    float g = _MieG;
+
+    float a = 3.0 / (8.0 * PI);
+    float b = (1.0 - g * g) / (2.0 + g * g);
+    float c = 1.0 + cosTheta * cosTheta;
+    float d = pow(max(0.0001, 1.0 + g * g - 2.0 * g * cosTheta), 1.5);
+
+    float phase = a * b * c / d;
+
+    return phase;
+}
+
+float3 MieAbsorption(float h)
+{
+    float3 sigma = float3(4.4, 4.4, 4.4) * 1e-6;
+    float rho = exp(-h / _MieScaleHeight);
+    return sigma * rho;
+}
+
+float3 OzoneAbsorption(float h)
+{
+    float3 sigma = float3(0.650, 1.881, 0.085) * 1e-6;
+
+    float center = 25000.0;
+    float width = 15000.0;
+
+    float rho = max(0.0, 1.0 - abs(h - center) / width);
+
+    return sigma * rho;
+}
+
+// 只包含散射，不包含吸收。
+// 多重散射补光最后要乘这个，表示“环境入射光在当前点继续被散射出来”。
+float3 ScatteringOnlyCoefficient(float h)
+{
+    return RayleighCoefficient(h) + MieCoefficient(h);
+}
+
+float3 ExtinctionCoefficient(float h)
+{
+    float3 scattering = RayleighCoefficient(h) + MieCoefficient(h);
+    float3 absorption = MieAbsorption(h) + OzoneAbsorption(h);
+
+    return scattering + absorption;
+}
+
+float3 ScatteringCoefficient(float h, float cosTheta)
+{
+    float3 rayleigh = RayleighCoefficient(h) * RayleighPhase(cosTheta);
+    float3 mie = MieCoefficient(h) * MiePhase(cosTheta);
+
+    return rayleigh + 0.6 * mie;
+}
+
+float2 GetTransmittanceLutUv(float bottomRadius, float topRadius, float mu, float r)
+{
+    float H = sqrt(max(0.0, topRadius * topRadius - bottomRadius * bottomRadius));
+    float rho = sqrt(max(0.0, r * r - bottomRadius * bottomRadius));
+
+    float discriminant = r * r * (mu * mu - 1.0) + topRadius * topRadius;
+    float d = max(0.0, -r * mu + sqrt(max(0.0, discriminant)));
+
+    float dMin = topRadius - r;
+    float dMax = rho + H;
+
+    float xMu = (d - dMin) / max(0.0001, dMax - dMin);
+    float xR = rho / max(0.0001, H);
+
+    return saturate(float2(xMu, xR));
+}
+
+float3 TransmittanceToAtmosphereLut(float3 p, float3 dir)
+{
+    float bottomRadius = _PlanetRadius;
+    float topRadius = _PlanetRadius + _AtmosphereHeight;
+
+    float r = length(p);
+    r = clamp(r, bottomRadius, topRadius);
+
+    float3 upVector = normalize(p);
+
+    float mu = dot(upVector, normalize(dir));
+    mu = clamp(mu, -1.0, 1.0);
+
+    float2 uv = GetTransmittanceLutUv(bottomRadius, topRadius, mu, r);
+
+    return _TransmittanceLut.SampleLevel(
+        sampler_TransmittanceLut,
+        uv,
+        0
+    ).rgb;
+}
+
+float3 SampleMultiScatteringLut(float3 p, float3 lightDir)
+{
+    float h = GetHeight(p);
+
+    float3 upVector = normalize(p);
+    float cosSunZenith = dot(upVector, normalize(lightDir));
+
+    float2 uv;
+    uv.x = cosSunZenith * 0.5 + 0.5;
+    uv.y = saturate(h / _AtmosphereHeight);
+
+    // 这里的 GAll 表示当前位置附近的高阶散射环境入射光
+    float3 GAll = _MultiScatteringLut.SampleLevel(
+        sampler_MultiScatteringLut,
+        uv,
+        0
+    ).rgb;
+
+    // 把环境入射光再次在当前点散射出来
+    float3 sigmaS = ScatteringOnlyCoefficient(h);
+
+    return GAll * sigmaS;
+}
+
+float3 ComputeSkyColor(float3 cameraPos, float3 rayDir, float3 sunDir)
+{
+    float atmosphereRadius = _PlanetRadius + _AtmosphereHeight;
+
+    float2 atmosphereHit = RaySphere(cameraPos, rayDir, atmosphereRadius);
+
+    if (atmosphereHit.y < 0.0)
+    {
+        return 0.0;
+    }
+
+    float tStart = max(0.0, atmosphereHit.x);
+    float tEnd = atmosphereHit.y;
+
+    float2 planetHit = RaySphere(cameraPos, rayDir, _PlanetRadius);
+    if (planetHit.x > 0.0)
+    {
+        tEnd = min(tEnd, planetHit.x);
+    }
+
+    float distance = tEnd - tStart;
+
+    if (distance <= 0.0)
+    {
+        return 0.0;
+    }
+
+    float ds = distance / VIEW_SAMPLE_COUNT;
+
+    float3 color = 0.0;
+    float3 viewTransmittance = 1.0;
+
+    float cosTheta = dot(rayDir, sunDir);
+
+    float3 p = cameraPos + rayDir * (tStart + ds * 0.5);
+
+    [loop]
+    for (int i = 0; i < VIEW_SAMPLE_COUNT; i++)
+    {
+        float h = GetHeight(p);
+
+        float3 extinction = ExtinctionCoefficient(h);
+
+        // p 是当前小段中点，所以 T2 用半段衰减
+        float3 t2 = viewTransmittance * exp(-extinction * ds * 0.5);
+
+        // 单次散射
+        float3 t1 = TransmittanceToAtmosphereLut(p, sunDir);
+        float3 s = ScatteringCoefficient(h, cosTheta);
+
+        float3 singleScattering = t1 * s * t2 * ds * _SunIntensity;
+        color += singleScattering;
+
+        // 多重散射补光
+        // multiScattering 已经表示当前点的高阶散射出射能力，
+        // 还需要乘 p 到相机的透射率 t2，再沿视线积分 ds。
+        float3 multiScattering = SampleMultiScatteringLut(p, sunDir);
+        color += multiScattering * t2 * ds * _SunIntensity * _MultiScatteringContribution;
+
+        // 走完整段后，更新到下一段起点的透射率
+        viewTransmittance *= exp(-extinction * ds);
+
+        p += rayDir * ds;
+    }
+
+    return color;
+}
+
+float3 SkyViewDirFromUv(float2 uv)
+{
+    float azimuth = uv.x * 2.0 * PI;
+
+    // 从 -90° 到 +90°
+    float elevation = (uv.y - 0.5) * PI;
+
+    float y = sin(elevation);
+    float horizontal = cos(elevation);
+
+    float x = horizontal * cos(azimuth);
+    float z = horizontal * sin(azimuth);
+
+    return normalize(float3(x, y, z));
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _LutWidth || id.y >= _LutHeight)
+    {
+        return;
+    }
+
+    float2 uv = (float2(id.xy) + 0.5) / float2(_LutWidth, _LutHeight);
+
+    float3 rayDir = SkyViewDirFromUv(uv);
+
+    float3 cameraPos = float3(0.0, _PlanetRadius + _CameraHeight, 0.0);
+    float3 sunDir = normalize(_SunDirWS);
+
+    float3 color = ComputeSkyColor(cameraPos, rayDir, sunDir);
+
+    Result[id.xy] = float4(color, 1.0);
+}

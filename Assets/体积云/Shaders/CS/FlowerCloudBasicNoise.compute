@@ -1,0 +1,82 @@
+#pragma kernel CSMain
+
+#include "../Includes/FlowerCloudNoiseCommon.hlsl"
+
+#define FLOWER_BASIC_FREQUENCY 4.0
+#define FLOWER_BASIC_NOISE_MIX_FACTOR 0.5
+
+RWTexture3D<float> _BasicNoise;
+int3 _TextureSize;
+
+float FlowerBasicNoiseComposite(float4 noiseChannels)
+{
+    float worleyFBM =
+        noiseChannels.y * 0.625
+        + noiseChannels.z * 0.25
+        + noiseChannels.w * 0.125;
+
+    return FlowerRemap(
+        noiseChannels.x,
+        worleyFBM - 1.0,
+        1.0,
+        0.0,
+        1.0
+    );
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (any(dispatchThreadID >= (uint3)_TextureSize))
+    {
+        return;
+    }
+
+    float3 uvw =
+        (float3(dispatchThreadID) + 0.5)
+        / float3(_TextureSize);
+
+    float perlinFBM = lerp(
+        1.0,
+        FlowerPerlinFBM(
+            uvw,
+            FLOWER_BASIC_FREQUENCY,
+            7
+        ),
+        FLOWER_BASIC_NOISE_MIX_FACTOR
+    );
+
+    // Billowy Perlin shape used by flower.
+    perlinFBM = abs(perlinFBM * 2.0 - 1.0);
+
+    float4 noiseChannels = 0.0;
+
+    noiseChannels.y = FlowerWorleyFBM(
+        uvw,
+        FLOWER_BASIC_FREQUENCY
+    );
+
+    noiseChannels.z = FlowerWorleyFBM(
+        uvw,
+        FLOWER_BASIC_FREQUENCY * 2.0
+    );
+
+    noiseChannels.w = FlowerWorleyFBM(
+        uvw,
+        FLOWER_BASIC_FREQUENCY * 4.0
+    );
+
+    noiseChannels.x = FlowerRemap(
+        perlinFBM,
+        0.0,
+        1.0,
+        noiseChannels.y,
+        1.0
+    );
+
+    // flower writes to an R8 normalized image, which clamps to [0,1].
+    // We clamp explicitly because the Unity debug target is R16_SFloat.
+    _BasicNoise[dispatchThreadID] = saturate(
+        FlowerBasicNoiseComposite(noiseChannels)
+    );
+}

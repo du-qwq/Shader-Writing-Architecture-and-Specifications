@@ -1,0 +1,1286 @@
+#pragma kernel CSMain
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+#define MAX_VIEW_STEP_COUNT 128
+#define MAX_LIGHT_STEP_COUNT 16
+
+TEXTURE3D(_FlowerCloudBasicNoise);
+SAMPLER(sampler_FlowerCloudBasicNoise);
+
+TEXTURE3D(_FlowerCloudDetailNoise);
+SAMPLER(sampler_FlowerCloudDetailNoise);
+
+TEXTURE2D(_FlowerCloudWeather);
+SAMPLER(sampler_FlowerCloudWeather);
+
+TEXTURE2D(_FlowerCloudCurl);
+SAMPLER(sampler_FlowerCloudCurl);
+
+TEXTURE2D(_FlowerCloudCoverageNoise);
+SAMPLER(sampler_FlowerCloudCoverageNoise);
+
+TEXTURE2D(_FlowerAtmosphereTransmittance);
+SAMPLER(sampler_FlowerAtmosphereTransmittance);
+
+TEXTURE2D(_FlowerAtmosphereMultiScatter);
+SAMPLER(sampler_FlowerAtmosphereMultiScatter);
+
+TEXTURE2D(_FlowerCloudDistantLit);
+SAMPLER(sampler_FlowerCloudDistantLit);
+
+TEXTURE3D(_FlowerFroxelScatter);
+SAMPLER(sampler_FlowerFroxelScatter);
+
+TEXTURE3D(_FlowerDistantLitGrid);
+SAMPLER(sampler_FlowerDistantLitGrid);
+
+RWTexture2D<float4> _CloudColorTexture;
+RWTexture2D<float> _CloudDepthTexture;
+
+int2 _OutputSize;
+int2 _FullResolution;
+
+float3 _CameraPositionWS;
+float3 _CameraForwardWS;
+float3 _CameraRightWS;
+float3 _CameraUpWS;
+float _CameraTanHalfFov;
+float _CameraAspect;
+int _FrameIndex;
+
+float3 _PlanetCenter;
+float _PlanetRadius;
+float _CloudBottom;
+float _CloudTop;
+
+float _CloudCoverage;
+float _CloudDensity;
+float _CloudWeatherUVScale;
+
+float4 _CloudBasicNoiseScale;
+float4 _CloudDetailNoiseScale;
+float4 _CloudDirection;
+float _CloudSpeed;
+
+int _ViewStepCount;
+int _LightStepCount;
+
+float _ViewExtinction;
+float _LightExtinction;
+float _LightTraceDistance;
+
+float3 _SunDirection;
+float3 _SunColor;
+float _SunIntensity;
+float _SunLightScale;
+
+float3 _AmbientColor;
+float _AmbientStrength;
+float3 _CloudAlbedo;
+
+float _PhaseForward;
+float _PhaseBackward;
+float _PhaseBlend;
+
+float _MultiScatterExtinction;
+float _MultiScatterScatter;
+
+int _EnablePowder;
+float _PowderPow;
+float _PowderScale;
+
+int _EnableAmbientTrace;
+float _AmbientTraceStrength;
+
+#include "../Includes/FlowerCloudDensityCommon.hlsl"
+#include "../Includes/FlowerAtmosphereCommon.hlsl"
+
+struct FlowerShadowResult
+{
+    float transmittance0;
+    float transmittance1;
+};
+
+struct FlowerPhaseResult
+{
+    float phase0;
+    float phase1;
+};
+
+float2 RaySphere(
+    float3 rayOrigin,
+    float3 rayDirection,
+    float3 sphereCenter,
+    float sphereRadius)
+{
+    float3 offset = rayOrigin - sphereCenter;
+    float b = dot(offset, rayDirection);
+    float c = dot(offset, offset) - sphereRadius * sphereRadius;
+    float discriminant = b * b - c;
+
+    if (discriminant < 0.0)
+    {
+        return float2(-1.0, -1.0);
+    }
+
+    float squareRoot = sqrt(discriminant);
+    return float2(-b - squareRoot, -b + squareRoot);
+}
+
+float GetNearestPositiveHit(float2 hit)
+{
+    if (hit.x > 0.0)
+    {
+        return hit.x;
+    }
+
+    if (hit.y > 0.0)
+    {
+        return hit.y;
+    }
+
+    return 1e20;
+}
+
+bool GetCloudRaySegment(
+    float3 rayOrigin,
+    float3 rayDirection,
+    out float rayStart,
+    out float rayEnd)
+{
+    rayStart = 0.0;
+    rayEnd = 0.0;
+
+    float innerRadius = _PlanetRadius + _CloudBottom;
+    float outerRadius = _PlanetRadius + _CloudTop;
+
+    float2 innerHit = RaySphere(
+        rayOrigin,
+        rayDirection,
+        _PlanetCenter,
+        innerRadius
+    );
+
+    float2 outerHit = RaySphere(
+        rayOrigin,
+        rayDirection,
+        _PlanetCenter,
+        outerRadius
+    );
+
+    if (outerHit.y <= 0.0)
+    {
+        return false;
+    }
+
+    float cameraRadius = distance(rayOrigin, _PlanetCenter);
+
+    if (cameraRadius < innerRadius)
+    {
+        if (innerHit.y <= 0.0)
+        {
+            return false;
+        }
+
+        rayStart = innerHit.y;
+        rayEnd = outerHit.y;
+    }
+    else if (cameraRadius < outerRadius)
+    {
+        rayStart = 0.0;
+        rayEnd = outerHit.y;
+
+        if (innerHit.x > 0.0)
+        {
+            rayEnd = min(rayEnd, innerHit.x);
+        }
+    }
+    else
+    {
+        rayStart = max(outerHit.x, 0.0);
+        rayEnd = outerHit.y;
+
+        if (innerHit.x > rayStart && innerHit.x < rayEnd)
+        {
+            rayEnd = innerHit.x;
+        }
+    }
+
+    float2 planetHit = RaySphere(
+        rayOrigin,
+        rayDirection,
+        _PlanetCenter,
+        _PlanetRadius
+    );
+
+    float planetDistance = GetNearestPositiveHit(planetHit);
+
+    if (planetDistance <= rayStart)
+    {
+        return false;
+    }
+
+    rayEnd = min(rayEnd, planetDistance);
+    return rayEnd > rayStart;
+}
+
+float GetCloudHeight01(float3 positionWS)
+{
+    float heightAboveSurface =
+        distance(positionWS, _PlanetCenter) -
+        _PlanetRadius;
+
+    float cloudThickness =
+        max(_CloudTop - _CloudBottom, 0.0001);
+
+    return saturate(
+        (heightAboveSurface - _CloudBottom) /
+        cloudThickness
+    );
+}
+
+float3 GetDensityPositionMeter(float3 positionWS)
+{
+    float heightAboveSurface =
+        distance(positionWS, _PlanetCenter) -
+        _PlanetRadius;
+
+    return float3(
+        positionWS.x - _PlanetCenter.x,
+        heightAboveSurface,
+        positionWS.z - _PlanetCenter.z
+    );
+}
+
+float SampleCloudDensityDataWS(
+    float3 positionWS,
+    out float actualHeight01,
+    out int layerIndex)
+{
+    actualHeight01 = 0.0;
+    layerIndex = 0;
+
+    float heightAboveSurface =
+        distance(positionWS, _PlanetCenter) -
+        _PlanetRadius;
+
+    if (heightAboveSurface < _CloudBottom ||
+        heightAboveSurface > _CloudTop)
+    {
+        return 0.0;
+    }
+
+    float normalizedHeight =
+        GetCloudHeight01(positionWS);
+
+    return FlowerCloudMap(
+        GetDensityPositionMeter(positionWS),
+        normalizedHeight,
+        actualHeight01,
+        layerIndex
+    );
+}
+
+float SampleCloudDensityWS(float3 positionWS)
+{
+    float actualHeight01;
+    int layerIndex;
+
+    return SampleCloudDensityDataWS(
+        positionWS,
+        actualHeight01,
+        layerIndex
+    );
+}
+
+// Flower uses the same sign convention as its GLSL hgPhase:
+// denominator = 1 + g^2 + 2g*cosTheta.
+float FlowerHenyeyGreenstein(float g, float cosTheta)
+{
+    float gSquared = g * g;
+
+    float denominator = max(
+        1.0 + gSquared + 2.0 * g * cosTheta,
+        0.0001
+    );
+
+    return (1.0 - gSquared) /
+        (4.0 * PI * denominator * sqrt(denominator));
+}
+
+float FlowerDualLobePhase(float cosTheta)
+{
+    float forwardPhase =
+        FlowerHenyeyGreenstein(
+            _PhaseForward,
+            cosTheta
+        );
+
+    float backwardPhase =
+        FlowerHenyeyGreenstein(
+            _PhaseBackward,
+            cosTheta
+        );
+
+    return lerp(
+        forwardPhase,
+        backwardPhase,
+        _PhaseBlend
+    );
+}
+
+FlowerPhaseResult GetParticipatingMediaPhase(
+    float basePhase)
+{
+    FlowerPhaseResult result;
+
+    float uniformPhase =
+        1.0 / (4.0 * PI);
+
+    result.phase0 =
+        basePhase;
+
+    // Original Flower uses baseMsPhaseFactor = 0.5.
+    result.phase1 =
+        lerp(
+            uniformPhase,
+            basePhase,
+            0.5
+        );
+
+    return result;
+}
+
+float Hash12(float2 position)
+{
+    float3 hashPosition =
+        frac(float3(position.xyx) * 0.1031);
+
+    hashPosition +=
+        dot(
+            hashPosition,
+            hashPosition.yzx + 33.33
+        );
+
+    return frac(
+        (hashPosition.x + hashPosition.y) *
+        hashPosition.z
+    );
+}
+
+// Original Flower-style quadratic light-ray distribution.
+// Samples are concentrated close to the current view-ray sample.
+FlowerShadowResult VolumetricShadow(
+    float3 samplePositionWS,
+    float3 traceDirection,
+    float multiScatterExtinctionFactor)
+{
+    FlowerShadowResult result;
+    result.transmittance0 = 1.0;
+    result.transmittance1 = 1.0;
+
+    int lightStepCount =
+        clamp(
+            _LightStepCount,
+            1,
+            MAX_LIGHT_STEP_COUNT
+        );
+
+    float outerRadius =
+        _PlanetRadius + _CloudTop;
+
+    traceDirection = normalize(traceDirection);
+
+    float3 rayOrigin =
+        samplePositionWS +
+        traceDirection * 2.0;
+
+    float2 outerHit = RaySphere(
+        rayOrigin,
+        traceDirection,
+        _PlanetCenter,
+        outerRadius
+    );
+
+    if (outerHit.y <= 0.0)
+    {
+        return result;
+    }
+
+    float traceDistance =
+        min(
+            max(_LightTraceDistance, 1.0),
+            outerHit.y
+        );
+
+    float2 planetHit = RaySphere(
+        rayOrigin,
+        traceDirection,
+        _PlanetCenter,
+        _PlanetRadius
+    );
+
+    float planetDistance =
+        GetNearestPositiveHit(planetHit);
+
+    if (planetDistance < traceDistance)
+    {
+        result.transmittance0 = 0.0;
+        result.transmittance1 = 0.0;
+        return result;
+    }
+
+    float extinctionAccumulation0 = 0.0;
+    float extinctionAccumulation1 = 0.0;
+
+    float inverseStepCount =
+        1.0 / lightStepCount;
+
+    float previousT = 0.0;
+
+    [loop]
+    for (int index = 0;
+         index < MAX_LIGHT_STEP_COUNT;
+         index++)
+    {
+        if (index >= lightStepCount)
+        {
+            break;
+        }
+
+        float shadowT =
+            (index + 1.0) *
+            inverseStepCount;
+
+        float currentT =
+            shadowT * shadowT;
+
+        float deltaT =
+            currentT - previousT;
+
+        float segmentLength =
+            deltaT *
+            traceDistance;
+
+        float sampleDistance =
+            traceDistance *
+            (previousT + deltaT * 0.5);
+
+        previousT =
+            currentT;
+
+        float3 shadowSamplePosition =
+            rayOrigin +
+            traceDirection *
+            sampleDistance;
+
+        float density =
+            SampleCloudDensityWS(
+                shadowSamplePosition
+            );
+
+        float extinction0 =
+            density *
+            _LightExtinction;
+
+        float extinction1 =
+            extinction0 *
+            multiScatterExtinctionFactor;
+
+        extinctionAccumulation0 +=
+            extinction0 *
+            segmentLength;
+
+        extinctionAccumulation1 +=
+            extinction1 *
+            segmentLength;
+    }
+
+    result.transmittance0 =
+        exp(-extinctionAccumulation0);
+
+    result.transmittance1 =
+        exp(-extinctionAccumulation1);
+
+    return result;
+}
+
+float FlowerPowderEffectNew(
+    float depth,
+    float height,
+    float viewLightCosine)
+{
+    float r =
+        -abs(viewLightCosine) *
+        0.5 +
+        0.5;
+
+    r *= r;
+
+    height =
+        height *
+        (1.0 - r) +
+        r;
+
+    return depth * height;
+}
+
+float FlowerComputePowderEffect(
+    float density,
+    float actualHeight01,
+    float viewLightCosine)
+{
+    if (_EnablePowder == 0)
+    {
+        return 1.0;
+    }
+
+    float depthExponent =
+        FlowerDensityRemap(
+            actualHeight01,
+            0.3,
+            0.85,
+            0.5,
+            2.0
+        );
+
+    float depthBase =
+        clamp(
+            density *
+            8.0 *
+            _PowderPow,
+            0.0,
+            max(_PowderScale, 0.0001)
+        );
+
+    float depthProbability =
+        pow(
+            max(depthBase, 0.0),
+            depthExponent
+        );
+
+    depthProbability += 0.05;
+
+    float verticalBase =
+        FlowerDensityRemap(
+            actualHeight01,
+            0.07,
+            0.22,
+            0.1,
+            1.0
+        );
+
+    // Unity/D3D11 safety: avoid fractional pow of a negative value.
+    float verticalProbability =
+        pow(
+            max(verticalBase, 0.0),
+            0.8
+        );
+
+    return FlowerPowderEffectNew(
+        depthProbability,
+        verticalProbability,
+        viewLightCosine
+    );
+}
+
+float3 FlowerCloudSurfaceOriginWS()
+{
+    return
+        _PlanetCenter +
+        float3(
+            0.0,
+            _PlanetRadius,
+            0.0
+        );
+}
+
+float3 FlowerCloudConvertToAtmosphereKm(
+    float3 positionWS)
+{
+    float3 cameraUnitPositionMeter =
+        positionWS -
+        FlowerCloudSurfaceOriginWS();
+
+    return FlowerConvertToAtmosphereUnit(
+        cameraUnitPositionMeter,
+        _AtmosphereBottomRadius
+    );
+}
+
+float3 FlowerCloudConvertToCameraMeter(
+    float3 atmospherePositionKm)
+{
+    return
+        FlowerConvertToCameraUnit(
+            atmospherePositionKm,
+            _AtmosphereBottomRadius
+        ) +
+        FlowerCloudSurfaceOriginWS();
+}
+
+float3 FlowerCloudSampleAtmosphereTransmittance(
+    float3 positionWS,
+    float3 directionWS)
+{
+    float3 positionAtmosphereKm =
+        FlowerCloudConvertToAtmosphereKm(
+            positionWS
+        );
+
+    return FlowerAtmosphereSampleTransmittance(
+        _FlowerAtmosphereTransmittance,
+        sampler_FlowerAtmosphereTransmittance,
+        positionAtmosphereKm,
+        directionWS
+    );
+}
+
+float3 FlowerCloudSampleDistantLit(
+    float3 samplePositionWS)
+{
+    float3 samplePositionAtmosphereKm =
+        FlowerCloudConvertToAtmosphereKm(
+            samplePositionWS
+        );
+
+    float3 samplePositionRenderMeter =
+        FlowerConvertToCameraUnit(
+            samplePositionAtmosphereKm -
+            float3(
+                0.0,
+                _AtmosphereBottomRadius,
+                0.0
+            ),
+            0.0
+        );
+
+    float worldDistanceMeter =
+        length(
+            samplePositionRenderMeter
+        );
+
+    float2 uv =
+        saturate(
+            float2(
+                worldDistanceMeter /
+                FLOWER_DISTANT_SKY_LIT_MAX_METER,
+                0.5
+            )
+        );
+
+    return _FlowerCloudDistantLit.SampleLevel(
+        sampler_FlowerCloudDistantLit,
+        uv,
+        0.0
+    ).rgb;
+}
+
+float4 FlowerCloudSampleFroxel(
+    float2 uv,
+    float depthKm)
+{
+    float slice =
+        FlowerAerialPerspectiveDepthToSlice(
+            depthKm
+        );
+
+    float weight = 1.0;
+
+    if (slice < 0.5)
+    {
+        weight =
+            saturate(
+                slice * 2.0
+            );
+
+        slice = 0.5;
+    }
+
+    uint froxelWidth;
+    uint froxelHeight;
+    uint froxelDepth;
+
+    _FlowerFroxelScatter.GetDimensions(
+        froxelWidth,
+        froxelHeight,
+        froxelDepth
+    );
+
+    float w =
+        sqrt(
+            slice /
+            max(
+                (float)froxelDepth,
+                1.0
+            )
+        );
+
+    return
+        weight *
+        _FlowerFroxelScatter.SampleLevel(
+            sampler_FlowerFroxelScatter,
+            float3(
+                uv,
+                saturate(w)
+            ),
+            0.0
+        );
+}
+
+float3 FlowerCloudSampleDistantGrid(
+    float2 uv,
+    float3 samplePositionWS)
+{
+    float3 samplePositionAtmosphereKm =
+        FlowerCloudConvertToAtmosphereKm(
+            samplePositionWS
+        );
+
+    float3 samplePositionCameraMeter =
+        FlowerCloudConvertToCameraMeter(
+            samplePositionAtmosphereKm
+        );
+
+    float depthKm =
+        length(
+            samplePositionCameraMeter -
+            _CameraPositionWS
+        ) *
+        0.001;
+
+    float slice =
+        FlowerDistantGridDepthToSlice(
+            depthKm
+        );
+
+    float weight = 1.0;
+
+    if (slice < 0.5)
+    {
+        weight =
+            saturate(
+                slice * 2.0
+            );
+
+        slice = 0.5;
+    }
+
+    uint gridWidth;
+    uint gridHeight;
+    uint gridDepth;
+
+    _FlowerDistantLitGrid.GetDimensions(
+        gridWidth,
+        gridHeight,
+        gridDepth
+    );
+
+    float w =
+        sqrt(
+            slice /
+            max(
+                (float)gridDepth,
+                1.0
+            )
+        );
+
+    return
+        weight *
+        _FlowerDistantLitGrid.SampleLevel(
+            sampler_FlowerDistantLitGrid,
+            float3(
+                uv,
+                saturate(w)
+            ),
+            0.0
+        ).rgb;
+}
+
+float3 GetWorldRayDirection(float2 uv)
+{
+    float2 ndc =
+        uv * 2.0 - 1.0;
+
+    float3 rayDirection =
+        _CameraForwardWS +
+        ndc.x *
+        _CameraRightWS *
+        (_CameraAspect * _CameraTanHalfFov) +
+        ndc.y *
+        _CameraUpWS *
+        _CameraTanHalfFov;
+
+    return normalize(rayDirection);
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(
+    uint3 dispatchThreadID :
+    SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >=
+            (uint)_OutputSize.x ||
+        dispatchThreadID.y >=
+            (uint)_OutputSize.y)
+    {
+        return;
+    }
+
+    float2 uv =
+        (float2(dispatchThreadID.xy) + 0.5) /
+        float2(_OutputSize);
+
+    float3 rayDirection =
+        GetWorldRayDirection(uv);
+
+    float rayStart;
+    float rayEnd;
+
+    bool intersectsCloud =
+        GetCloudRaySegment(
+            _CameraPositionWS,
+            rayDirection,
+            rayStart,
+            rayEnd
+        );
+
+    if (!intersectsCloud)
+    {
+        _CloudColorTexture[
+            dispatchThreadID.xy
+        ] = float4(0.0, 0.0, 0.0, 1.0);
+
+        _CloudDepthTexture[
+            dispatchThreadID.xy
+        ] = 0.0;
+
+        return;
+    }
+
+    int viewStepCount =
+        clamp(
+            _ViewStepCount,
+            1,
+            MAX_VIEW_STEP_COUNT
+        );
+
+    float rayLength =
+        rayEnd - rayStart;
+
+    float stepLength =
+        rayLength /
+        viewStepCount;
+
+    float2 jitterPosition =
+        float2(dispatchThreadID.xy);
+
+    jitterPosition +=
+        float2(
+            _FrameIndex * 17,
+            _FrameIndex * 29
+        );
+
+    float jitter =
+        Hash12(jitterPosition);
+
+    float currentDistance =
+        rayStart +
+        stepLength *
+        jitter;
+
+    float viewTransmittance = 1.0;
+    float3 scatteredLight = 0.0;
+
+    float firstCloudDepth = 0.0;
+    float weightedDepth = 0.0;
+    float depthWeight = 0.0;
+
+    float3 rayHitPositionAtmosphereKm = 0.0;
+    float rayHitPositionWeight = 0.0;
+
+    float viewLightCosine =
+        dot(
+            rayDirection,
+            _SunDirection
+        );
+
+    // Original Flower calls the phase with -VoL.
+    float basePhase =
+        FlowerDualLobePhase(
+            -viewLightCosine
+        );
+
+    FlowerPhaseResult participatingPhase =
+        GetParticipatingMediaPhase(
+            basePhase
+        );
+
+    float sunsetScale =
+        1.0 +
+        saturate(
+            1.0 -
+            _SunDirection.y * 2.0
+        );
+
+    float multiScatterExtinctionFactor =
+        _MultiScatterExtinction /
+        sunsetScale;
+
+    float multiScatterScatterFactor =
+        _MultiScatterScatter;
+
+    float3 rayStartPosition =
+        _CameraPositionWS +
+        rayDirection *
+        rayStart;
+
+    float3 rayEndPosition =
+        _CameraPositionWS +
+        rayDirection *
+        rayEnd;
+
+    float3 atmosphereTransmittanceStart =
+        FlowerCloudSampleAtmosphereTransmittance(
+            rayStartPosition,
+            _SunDirection
+        );
+
+    float3 atmosphereTransmittanceEnd =
+        FlowerCloudSampleAtmosphereTransmittance(
+            rayEndPosition,
+            _SunDirection
+        );
+
+    float3 distantLitStart =
+        FlowerCloudSampleDistantGrid(
+            uv,
+            rayStartPosition
+        );
+
+    float3 distantLitEnd =
+        FlowerCloudSampleDistantGrid(
+            uv,
+            rayEndPosition
+        );
+
+    float3 baseSunlightTerm =
+        _SunColor *
+        _SunIntensity *
+        _SunLightScale;
+
+    [loop]
+    for (int index = 0;
+         index < MAX_VIEW_STEP_COUNT;
+         index++)
+    {
+        if (index >= viewStepCount)
+        {
+            break;
+        }
+
+        float3 samplePosition =
+            _CameraPositionWS +
+            rayDirection *
+            currentDistance;
+
+        float3 samplePositionAtmosphereKm =
+            FlowerCloudConvertToAtmosphereKm(
+                samplePosition
+            );
+
+        rayHitPositionAtmosphereKm +=
+            samplePositionAtmosphereKm *
+            viewTransmittance;
+
+        rayHitPositionWeight +=
+            viewTransmittance;
+
+        float actualHeight01;
+        int layerIndex;
+
+        float density =
+            SampleCloudDensityDataWS(
+                samplePosition,
+                actualHeight01,
+                layerIndex
+            );
+
+        if (density > 0.000001)
+        {
+            if (firstCloudDepth <= 0.0)
+            {
+                firstCloudDepth =
+                    currentDistance;
+            }
+
+            float sigmaE0 =
+                max(
+                    density *
+                    _ViewExtinction,
+                    0.00000001
+                );
+
+            float3 sigmaS0 =
+                sigmaE0 *
+                _CloudAlbedo;
+
+            float sigmaE1 =
+                max(
+                    sigmaE0 *
+                    multiScatterExtinctionFactor,
+                    0.00000001
+                );
+
+            float3 sigmaS1 =
+                sigmaS0 *
+                multiScatterScatterFactor;
+
+            float opticalDepth =
+                sigmaE0 *
+                stepLength;
+
+            float beerTransmittance =
+                exp(-opticalDepth);
+
+            // SIGGRAPH 2017 formula used by Flower.
+            float stepTransmittance =
+                max(
+                    beerTransmittance,
+                    exp(-opticalDepth * 0.25) *
+                    0.7
+                );
+
+            float rayProgress =
+                saturate(
+                    (currentDistance - rayStart) /
+                    max(rayLength, 0.0001)
+                );
+
+            float3 atmosphereTransmittance =
+                lerp(
+                    atmosphereTransmittanceStart,
+                    atmosphereTransmittanceEnd,
+                    rayProgress
+                );
+
+            float3 distantLit =
+                lerp(
+                    distantLitStart,
+                    distantLitEnd,
+                    rayProgress
+                );
+
+            float3 sunlightTerm =
+                atmosphereTransmittance *
+                baseSunlightTerm;
+
+            float powderEffect =
+                FlowerComputePowderEffect(
+                    density,
+                    actualHeight01,
+                    viewLightCosine
+                );
+
+            FlowerShadowResult shadow =
+                VolumetricShadow(
+                    samplePosition,
+                    _SunDirection,
+                    _MultiScatterExtinction
+                );
+
+            float3 sunLuminance0 =
+                shadow.transmittance0 *
+                sunlightTerm *
+                participatingPhase.phase0 *
+                powderEffect;
+
+            float3 sunLuminance1 =
+                shadow.transmittance1 *
+                sunlightTerm *
+                participatingPhase.phase1 *
+                powderEffect;
+
+            // Flower additionally traces upward for ambient visibility.
+            // The original source radiance comes from sky/distant-light data.
+            // Until those systems are ported, Unity uses Ambient Color as the source.
+            if (_EnableAmbientTrace != 0)
+            {
+                FlowerShadowResult ambientShadow =
+                    VolumetricShadow(
+                        samplePosition,
+                        float3(0.0, 1.0, 0.0),
+                        _MultiScatterExtinction
+                    );
+
+                float horizonContribution =
+                    1.0 -
+                    _SunDirection.y *
+                    _SunDirection.y;
+
+                float3 groundToCloudTransfer =
+                    FlowerCloudSampleDistantLit(
+                        samplePosition
+                    );
+
+                float3 ambientTraceLuminance =
+                    groundToCloudTransfer *
+                    _AmbientTraceStrength *
+                    powderEffect *
+                    horizonContribution *
+                    lerp(
+                        atmosphereTransmittance,
+                        1.0,
+                        saturate(
+                            1.0 -
+                            viewTransmittance
+                        )
+                    );
+
+                sunLuminance0 +=
+                    ambientShadow.transmittance0 *
+                    ambientTraceLuminance;
+
+                sunLuminance1 +=
+                    ambientShadow.transmittance1 *
+                    ambientTraceLuminance;
+            }
+
+            if (layerIndex == 0)
+            {
+                sunLuminance0 +=
+                    distantLit *
+                    _AmbientStrength;
+            }
+
+            // Flower integrates higher-order scattering first.
+            float3 scatterSource1 =
+                sunLuminance1 *
+                sigmaS1;
+
+            float3 stepScatter1 =
+                viewTransmittance *
+                (
+                    scatterSource1 -
+                    scatterSource1 *
+                    stepTransmittance
+                ) /
+                max(
+                    sigmaE1,
+                    0.0001
+                );
+
+            scatteredLight +=
+                stepScatter1;
+
+            float3 scatterSource0 =
+                sunLuminance0 *
+                sigmaS0;
+
+            float3 stepScatter0 =
+                viewTransmittance *
+                (
+                    scatterSource0 -
+                    scatterSource0 *
+                    stepTransmittance
+                ) /
+                max(
+                    sigmaE0,
+                    0.0001
+                );
+
+            scatteredLight +=
+                stepScatter0;
+
+            float contribution =
+                viewTransmittance *
+                (1.0 - stepTransmittance);
+
+            weightedDepth +=
+                currentDistance *
+                contribution;
+
+            depthWeight +=
+                contribution;
+
+            viewTransmittance *=
+                stepTransmittance;
+
+            if (viewTransmittance <= 0.001)
+            {
+                break;
+            }
+        }
+
+        currentDistance +=
+            stepLength;
+    }
+
+    float cloudDepth =
+        firstCloudDepth;
+
+    if (depthWeight > 0.000001)
+    {
+        cloudDepth =
+            weightedDepth /
+            depthWeight;
+    }
+
+    if (rayHitPositionWeight > 0.0)
+    {
+        rayHitPositionAtmosphereKm /=
+            rayHitPositionWeight;
+
+        float3 cameraPositionAtmosphereKm =
+            FlowerCloudConvertToAtmosphereKm(
+                _CameraPositionWS
+            );
+
+        float rayHitDepthKm =
+            length(
+                rayHitPositionAtmosphereKm -
+                cameraPositionAtmosphereKm
+            );
+
+        float4 airPerspective =
+            FlowerCloudSampleFroxel(
+                uv,
+                rayHitDepthKm
+            );
+
+        scatteredLight =
+            scatteredLight *
+            (1.0 - airPerspective.a) +
+            airPerspective.rgb *
+            (1.0 - viewTransmittance);
+    }
+
+    float4 result =
+        float4(
+            scatteredLight,
+            viewTransmittance
+        );
+
+    if (any(isnan(result)) ||
+        any(isinf(result)))
+    {
+        result =
+            float4(
+                0.0,
+                0.0,
+                0.0,
+                1.0
+            );
+
+        cloudDepth = 0.0;
+    }
+
+    _CloudColorTexture[
+        dispatchThreadID.xy
+    ] = result;
+
+    _CloudDepthTexture[
+        dispatchThreadID.xy
+    ] = cloudDepth;
+}

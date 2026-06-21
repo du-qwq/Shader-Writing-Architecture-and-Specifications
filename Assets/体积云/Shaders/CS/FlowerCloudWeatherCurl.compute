@@ -1,0 +1,141 @@
+#pragma kernel GenerateWeather
+#pragma kernel GenerateCurl
+#pragma kernel GenerateCoverage
+
+#include "../Includes/FlowerCloudNoiseCommon.hlsl"
+
+RWTexture2D<float> _WeatherMap;
+RWTexture2D<float4> _CurlMap;
+RWTexture2D<float> _CoverageMap;
+
+int2 _TextureSize;
+float _Seed;
+
+float FlowerFBM2D(float2 uv, float baseFrequency, int octaveCount)
+{
+    float result = 0.0;
+    float amplitude = 0.5;
+    float amplitudeSum = 0.0;
+    float frequency = baseFrequency;
+
+    [loop]
+    for (int octave = 0; octave < octaveCount; octave++)
+    {
+        float3 position = float3(uv, _Seed);
+        float noise = FlowerGradientNoise(position * frequency, frequency);
+
+        result += (noise * 0.5 + 0.5) * amplitude;
+        amplitudeSum += amplitude;
+
+        frequency *= 2.0;
+        amplitude *= 0.5;
+    }
+
+    return result / max(amplitudeSum, 0.0001);
+}
+
+float FlowerWeatherNoise(float2 uv)
+{
+    float2 warp;
+
+    warp.x = FlowerFBM2D(uv + float2(0.17, 0.71), 2.0, 4);
+    warp.y = FlowerFBM2D(uv + float2(0.63, 0.29), 2.0, 4);
+    warp = warp * 2.0 - 1.0;
+
+    float2 warpedUV = frac(uv + warp * 0.12);
+
+    float macroShape = FlowerFBM2D(warpedUV, 1.0, 5);
+    float largeShape = FlowerFBM2D(warpedUV + float2(0.31, 0.47), 2.0, 5);
+    float mediumShape = FlowerFBM2D(warpedUV + float2(0.73, 0.19), 4.0, 4);
+
+    float weatherShape = macroShape * 0.50 + largeShape * 0.35 + mediumShape * 0.15;
+
+    // 让 Weather Map 出现大片纯黑区域，避免天空被云完全盖满。
+    weatherShape = pow(saturate(weatherShape), 0.85);
+
+    return smoothstep(0.50, 0.61, weatherShape);
+}
+
+float FlowerCurlPotential(float2 uv)
+{
+    float firstNoise = FlowerFBM2D(uv, 4.0, 4);
+    float secondNoise = FlowerFBM2D(uv + float2(0.41, 0.73), 8.0, 3);
+
+    return firstNoise * 0.7 + secondNoise * 0.3;
+}
+
+[numthreads(8, 8, 1)]
+void GenerateWeather(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_TextureSize.x ||
+        dispatchThreadID.y >= (uint)_TextureSize.y)
+    {
+        return;
+    }
+
+    float2 uv = (float2(dispatchThreadID.xy) + 0.5) / float2(_TextureSize);
+    float weather = FlowerWeatherNoise(uv);
+
+    _WeatherMap[dispatchThreadID.xy] = saturate(weather);
+}
+
+[numthreads(8, 8, 1)]
+void GenerateCurl(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_TextureSize.x ||
+        dispatchThreadID.y >= (uint)_TextureSize.y)
+    {
+        return;
+    }
+
+    float2 uv = (float2(dispatchThreadID.xy) + 0.5) / float2(_TextureSize);
+    float2 texelSize = 1.0 / float2(_TextureSize);
+
+    float left = FlowerCurlPotential(frac(uv - float2(texelSize.x, 0.0)));
+    float right = FlowerCurlPotential(frac(uv + float2(texelSize.x, 0.0)));
+    float bottom = FlowerCurlPotential(frac(uv - float2(0.0, texelSize.y)));
+    float top = FlowerCurlPotential(frac(uv + float2(0.0, texelSize.y)));
+
+    float derivativeX = (right - left) / max(texelSize.x * 2.0, 0.0001);
+    float derivativeY = (top - bottom) / max(texelSize.y * 2.0, 0.0001);
+
+    float2 curl = float2(derivativeY, -derivativeX);
+    float curlLength = length(curl);
+
+    if (curlLength > 0.0001)
+    {
+        curl /= curlLength;
+    }
+
+    float verticalNoise = FlowerFBM2D(uv + float2(0.17, 0.83), 6.0, 3);
+
+    float3 encodedCurl = float3(
+        curl.x,
+        verticalNoise * 2.0 - 1.0,
+        curl.y
+    );
+
+    encodedCurl = encodedCurl * 0.5 + 0.5;
+
+    _CurlMap[dispatchThreadID.xy] = float4(encodedCurl, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void GenerateCoverage(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    if (dispatchThreadID.x >= (uint)_TextureSize.x ||
+        dispatchThreadID.y >= (uint)_TextureSize.y)
+    {
+        return;
+    }
+
+    float2 uv = (float2(dispatchThreadID.xy) + 0.5) / float2(_TextureSize);
+
+    float baseNoise = FlowerFBM2D(uv + float2(0.23, 0.47), 3.0, 5);
+    float detailNoise = FlowerFBM2D(uv + float2(0.71, 0.19), 10.0, 3);
+
+    float coverageNoise = baseNoise * 0.8 + detailNoise * 0.2;
+    coverageNoise = smoothstep(0.35, 0.72, coverageNoise);
+
+    _CoverageMap[dispatchThreadID.xy] = saturate(coverageNoise);
+}
