@@ -80,6 +80,9 @@ namespace FlowerClouds
             [Range(0.0f, 0.98f)]
             public float temporalBlend = 0.90f;
 
+            [Header("Blue Noise")]
+            public Texture2D blueNoiseTexture;
+
             [Range(8, 128)]
             public int viewStepCount = 64;
 
@@ -230,6 +233,9 @@ namespace FlowerClouds
 
             private static readonly int FrameIndexID =
                 Shader.PropertyToID("_FrameIndex");
+
+            private static readonly int BlueNoiseTextureID =
+                Shader.PropertyToID("_FlowerCloudBlueNoise");
 
             private static readonly int PlanetCenterID =
                 Shader.PropertyToID("_PlanetCenter");
@@ -895,6 +901,13 @@ namespace FlowerClouds
                         kernel,
                         GlobalCoverageNoiseID,
                         coverageNoise
+                    );
+
+                    commandBuffer.SetComputeTextureParam(
+                        settings.raymarchCompute,
+                        kernel,
+                        BlueNoiseTextureID,
+                        settings.blueNoiseTexture != null ? settings.blueNoiseTexture : Texture2D.grayTexture
                     );
 
                     commandBuffer.SetComputeTextureParam(

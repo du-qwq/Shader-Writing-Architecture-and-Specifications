@@ -168,36 +168,38 @@ MonoBehaviour:
   m_Active: 1
   settings:
     raymarchCompute: {fileID: 7200000, guid: 465c8717965792e4e871be054751cdf4, type: 3}
+    reconstructCompute: {fileID: 7200000, guid: 8f080134ff2ce64459d4a5a4c78553da,
+      type: 3}
     compositeShader: {fileID: 4800000, guid: 7bb99ecfd1a690e40a2914c0f84ac040, type: 3}
-    ambientColor: {r: 0.25, g: 0.35, b: 0.55, a: 1}
-    sunIntensity: 1.5
-    ambientStrength: 0.25
+    cloudAmbientScale: 0.15
     cloudAlbedo: {r: 1, g: 1, b: 1, a: 1}
     sunLightScale: 10
-    lightTraceDistance: 15000
+    cloudLightBasicStepKm: 15
     multiScatterExtinction: 0.5
     multiScatterScatter: 0.5
     enablePowder: 1
     powderPow: 1
     powderScale: 1
-    enableAmbientTrace: 1
-    ambientTraceStrength: 0.35
+    enableGroundContribution: 1
     planetCenter: {x: 0, y: -6360000, z: 0}
     planetRadius: 6360000
     cloudBottom: 500
     cloudTop: 11000
-    cloudCoverage: 0.65
-    cloudDensity: 2
-    weatherUVScale: 0.03
+    cloudCoverage: 0.01
+    cloudDensity: 0.01
+    weatherUVScale: {x: 0.03, y: 0.03}
     basicNoiseScale: {x: 0.15, y: 0.15, z: 0.15}
     detailNoiseScale: {x: 0.8, y: 0.8, z: 0.8}
     cloudDirection: {x: 1, y: 0, z: 0}
     cloudSpeed: 0.05
-    downsample: 4
-    viewStepCount: 64
+    downsample: 2
+    enableTemporalReconstruction: 1
+    temporalBlend: 0.9
+    blueNoiseTexture: {fileID: 2800000, guid: 3e25a4239ab994c4a9899b7b68c06171, type: 3}
+    viewStepCount: 96
     lightStepCount: 6
-    viewExtinction: 0.001
-    lightExtinction: 0.0015
+    cloudMaxTracingDistanceKm: 50
+    cloudTracingStartMaxDistanceKm: 350
     phaseForward: 0.65
     phaseBackward: -0.2
     phaseBlend: 0.2

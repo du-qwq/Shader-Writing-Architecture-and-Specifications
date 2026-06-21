@@ -20,6 +20,9 @@ SAMPLER(sampler_FlowerCloudCurl);
 TEXTURE2D(_FlowerCloudCoverageNoise);
 SAMPLER(sampler_FlowerCloudCoverageNoise);
 
+TEXTURE2D(_FlowerCloudBlueNoise);
+SAMPLER(sampler_FlowerCloudBlueNoise);
+
 TEXTURE2D(_FlowerAtmosphereTransmittance);
 SAMPLER(sampler_FlowerAtmosphereTransmittance);
 
@@ -469,6 +472,48 @@ float Hash12(float2 position)
         (hashPosition.x + hashPosition.y) *
         hashPosition.z
     );
+}
+
+float SampleBlueNoiseJitter(uint2 pixelCoord)
+{
+    uint width;
+    uint height;
+
+    _FlowerCloudBlueNoise.GetDimensions(
+        width,
+        height
+    );
+
+    if (width == 0 || height == 0)
+    {
+        return Hash12(
+            float2(pixelCoord)
+        );
+    }
+
+    float2 frameOffset =
+        float2(
+            (_FrameIndex * 17) & 127,
+            (_FrameIndex * 29) & 127
+        );
+
+    float2 noiseCoord =
+        fmod(
+            float2(pixelCoord) +
+            frameOffset,
+            float2(width, height)
+        );
+
+    float2 noiseUV =
+        (noiseCoord + 0.5) /
+        float2(width, height);
+
+    return SAMPLE_TEXTURE2D_LOD(
+        _FlowerCloudBlueNoise,
+        sampler_FlowerCloudBlueNoise,
+        noiseUV,
+        0.0
+    ).r;
 }
 
 // Original Flower-style quadratic light-ray distribution.
@@ -1011,17 +1056,10 @@ void CSMain(
         rayLength /
         viewStepCount;
 
-    float2 jitterPosition =
-        float2(dispatchThreadID.xy);
-
-    jitterPosition +=
-        float2(
-            _FrameIndex * 17,
-            _FrameIndex * 29
-        );
-
     float jitter =
-        Hash12(jitterPosition);
+        SampleBlueNoiseJitter(
+            dispatchThreadID.xy
+        );
 
     float currentDistance =
         rayStart +
