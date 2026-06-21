@@ -363,7 +363,7 @@ namespace FlowerClouds
                 Shader.PropertyToID("_AtmosphereTopRadius");
 
             private static readonly int CompositeCloudColorID =
-                Shader.PropertyToID("_FlowerCloudColorTexture");
+                Shader.PropertyToID("_CloudColorTexture");
 
             public FlowerCloudRenderPass(
                 Settings settings,
