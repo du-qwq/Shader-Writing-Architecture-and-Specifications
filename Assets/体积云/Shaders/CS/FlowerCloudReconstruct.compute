@@ -11,7 +11,11 @@ SAMPLER(sampler_CloudLowResDepthTexture);
 TEXTURE2D_X(_CloudHistoryTexture);
 SAMPLER(sampler_CloudHistoryTexture);
 
+TEXTURE2D_X(_CloudHistoryDepthTexture);
+SAMPLER(sampler_CloudHistoryDepthTexture);
+
 RWTexture2D<float4> _CloudReconstructionTexture;
+RWTexture2D<float> _CloudDepthReconstructionTexture;
 
 int2 _OutputSize;
 int2 _FullResolution;
@@ -119,6 +123,9 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
         _CloudReconstructionTexture[dispatchThreadID.xy] =
             currentColor;
 
+        _CloudDepthReconstructionTexture[dispatchThreadID.xy] =
+            cloudDepth;
+
         return;
     }
 
@@ -172,6 +179,35 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
             0.0
         );
 
+    float historyDepth =
+        SAMPLE_TEXTURE2D_X_LOD(
+            _CloudHistoryDepthTexture,
+            sampler_CloudHistoryDepthTexture,
+            historyUV,
+            0.0
+        ).r;
+
+    if (historyDepth <= 0.0001)
+    {
+        temporalWeight = 0.0;
+    }
+
+    float depthDifference =
+        abs(historyDepth - cloudDepth);
+
+    float depthTolerance =
+        max(
+            200.0,
+            cloudDepth * 0.15
+        );
+
+    temporalWeight *=
+        saturate(
+            1.0 -
+            depthDifference /
+            max(depthTolerance, 0.0001)
+        );
+
     historyColor =
         ClampHistoryToCurrent(
             historyColor,
@@ -185,6 +221,13 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
             temporalWeight
         );
 
+    float resultDepth =
+        lerp(
+            cloudDepth,
+            historyDepth,
+            temporalWeight
+        );
+
     result =
         lerp(
             result,
@@ -192,13 +235,28 @@ void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID)
             1.0 - saturate(currentColor.a)
         );
 
+    resultDepth =
+        lerp(
+            resultDepth,
+            cloudDepth,
+            1.0 - saturate(currentColor.a)
+        );
+
     if (any(isnan(result)) ||
-        any(isinf(result)))
+        any(isinf(result)) ||
+        isnan(resultDepth) ||
+        isinf(resultDepth))
     {
         result =
             currentColor;
+
+        resultDepth =
+            cloudDepth;
     }
 
     _CloudReconstructionTexture[dispatchThreadID.xy] =
         result;
+
+    _CloudDepthReconstructionTexture[dispatchThreadID.xy] =
+        resultDepth;
 }

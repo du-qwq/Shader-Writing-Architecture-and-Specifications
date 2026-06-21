@@ -189,7 +189,9 @@ namespace FlowerClouds
             private RTHandle cloudColorTexture;
             private RTHandle cloudDepthTexture;
             private RTHandle cloudReconstructionTexture;
+            private RTHandle cloudDepthReconstructionTexture;
             private RTHandle cloudHistoryTexture;
+            private RTHandle cloudDepthHistoryTexture;
             private RTHandle cameraColorCopy;
 
             private uint frameIndex;
@@ -334,8 +336,14 @@ namespace FlowerClouds
             private static readonly int CloudHistoryID =
                 Shader.PropertyToID("_CloudHistoryTexture");
 
+            private static readonly int CloudHistoryDepthID =
+                Shader.PropertyToID("_CloudHistoryDepthTexture");
+
             private static readonly int CloudReconstructionOutputID =
                 Shader.PropertyToID("_CloudReconstructionTexture");
+
+            private static readonly int CloudDepthReconstructionOutputID =
+                Shader.PropertyToID("_CloudDepthReconstructionTexture");
 
             private static readonly int GlobalBasicNoiseID =
                 Shader.PropertyToID("_FlowerCloudBasicNoise");
@@ -472,6 +480,33 @@ namespace FlowerClouds
                     FilterMode.Bilinear,
                     TextureWrapMode.Clamp,
                     name: "_FlowerCloudReconstructionHistory"
+                );
+
+                RenderTextureDescriptor depthReconstructionDescriptor =
+                    reconstructionDescriptor;
+
+                depthReconstructionDescriptor.graphicsFormat =
+                    GraphicsFormat.R32_SFloat;
+
+                RenderingUtils.ReAllocateIfNeeded(
+                    ref cloudDepthReconstructionTexture,
+                    depthReconstructionDescriptor,
+                    FilterMode.Bilinear,
+                    TextureWrapMode.Clamp,
+                    name: "_FlowerCloudDepthReconstruction"
+                );
+
+                RenderTextureDescriptor depthHistoryDescriptor =
+                    depthReconstructionDescriptor;
+
+                depthHistoryDescriptor.enableRandomWrite = false;
+
+                RenderingUtils.ReAllocateIfNeeded(
+                    ref cloudDepthHistoryTexture,
+                    depthHistoryDescriptor,
+                    FilterMode.Bilinear,
+                    TextureWrapMode.Clamp,
+                    name: "_FlowerCloudDepthReconstructionHistory"
                 );
 
                 RenderTextureDescriptor colorCopyDescriptor =
@@ -943,7 +978,9 @@ namespace FlowerClouds
                     if (settings.enableTemporalReconstruction &&
                         settings.reconstructCompute != null &&
                         cloudReconstructionTexture != null &&
-                        cloudHistoryTexture != null)
+                        cloudDepthReconstructionTexture != null &&
+                        cloudHistoryTexture != null &&
+                        cloudDepthHistoryTexture != null)
                     {
                         int reconstructKernel =
                             settings.reconstructCompute.FindKernel("CSMain");
@@ -1040,8 +1077,22 @@ namespace FlowerClouds
                         commandBuffer.SetComputeTextureParam(
                             settings.reconstructCompute,
                             reconstructKernel,
+                            CloudHistoryDepthID,
+                            cloudDepthHistoryTexture
+                        );
+
+                        commandBuffer.SetComputeTextureParam(
+                            settings.reconstructCompute,
+                            reconstructKernel,
                             CloudReconstructionOutputID,
                             cloudReconstructionTexture
+                        );
+
+                        commandBuffer.SetComputeTextureParam(
+                            settings.reconstructCompute,
+                            reconstructKernel,
+                            CloudDepthReconstructionOutputID,
+                            cloudDepthReconstructionTexture
                         );
 
                         int reconstructGroupCountX =
@@ -1061,6 +1112,11 @@ namespace FlowerClouds
                         commandBuffer.CopyTexture(
                             cloudReconstructionTexture,
                             cloudHistoryTexture
+                        );
+
+                        commandBuffer.CopyTexture(
+                            cloudDepthReconstructionTexture,
+                            cloudDepthHistoryTexture
                         );
 
                         cloudTextureForComposite =
@@ -1107,8 +1163,14 @@ namespace FlowerClouds
                 cloudReconstructionTexture?.Release();
                 cloudReconstructionTexture = null;
 
+                cloudDepthReconstructionTexture?.Release();
+                cloudDepthReconstructionTexture = null;
+
                 cloudHistoryTexture?.Release();
                 cloudHistoryTexture = null;
+
+                cloudDepthHistoryTexture?.Release();
+                cloudDepthHistoryTexture = null;
 
                 cameraColorCopy?.Release();
                 cameraColorCopy = null;
